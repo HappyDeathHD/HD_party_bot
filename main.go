@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	tgbotapi "github.com/ilpy20/telegram-bot-api/v7"
 )
 
 type Rally struct {
@@ -190,6 +190,7 @@ func main() {
 				ChatID:     update.Message.Chat.ID,
 			}
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, formatRally(rally))
+			msg.MessageThreadID = update.Message.MessageThreadID
 			msg.ReplyMarkup = buildKeyboard(rally, rally.Initiator)
 			sent, _ := bot.Send(msg)
 			rally.MessageID = sent.MessageID
