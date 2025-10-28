@@ -28,8 +28,8 @@ cd <ИМЯ_ПАПКИ>
 
 **4. Установить зависимость:**
 ```bash
-go mod init rally-party-bot
-go get github.com/go-telegram-bot-api/telegram-bot-api/v5
+go mod init hd-party-bot
+go get github.com/ilpy20/telegram-bot-api/v7@latest
 ```
 
 **5. Экспортировать токен (или прописать в коде):**
