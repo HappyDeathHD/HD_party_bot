@@ -6,19 +6,20 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/ilpy20/telegram-bot-api/v7"
 )
 
 type Rally struct {
-	Name        string
-	Date        string
-	Limit       int
-	Initiator   string
-	SignedUp    []string
-	PenciledIn  []string
-	MessageID   int
-	ChatID      int64
+	Name       string
+	Date       string
+	Limit      int
+	Initiator  string
+	SignedUp   []string
+	PenciledIn []string
+	MessageID  int
+	ChatID     int64
 }
 
 func parseCmd(cmd string) (name string, limit int, date string, err error) {
@@ -26,6 +27,7 @@ func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	if len(words) < 4 {
 		return "", 0, "", fmt.Errorf("Используйте /сбор <название> <лимит> <дата> [время] или /party ...")
 	}
+
 	var limIdx int = -1
 	for i := len(words) - 2; i >= 1; i-- {
 		if l, err := strconv.Atoi(words[i]); err == nil {
@@ -37,6 +39,7 @@ func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	if limIdx == -1 {
 		return "", 0, "", fmt.Errorf("не найден лимит")
 	}
+
 	name = strings.Join(words[1:limIdx], " ")
 	date = strings.Join(words[limIdx+1:], " ")
 	return
@@ -58,6 +61,7 @@ func parseRally(message string) (Rally, error) {
 	lines := strings.Split(message, "\n")
 	r := Rally{}
 	state := ""
+
 	for i := 0; i < len(lines); i++ {
 		line := cleanPrefix(strings.TrimSpace(lines[i]))
 		switch {
@@ -96,17 +100,22 @@ func parseRally(message string) (Rally, error) {
 			}
 		}
 	}
+
 	if r.Name == "" || r.Date == "" || r.Initiator == "" {
 		return Rally{}, fmt.Errorf("missing fields in structure")
 	}
+
 	return r, nil
 }
 
-
-
 func formatRally(r Rally) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🎉 Сбор: %s\n📅 Дата: %s\n🔢 Лимит: %d\n👤 Инициатор: %s\n\n✍️ Записались:\n", r.Name, r.Date, r.Limit, r.Initiator))
+
+	sb.WriteString(fmt.Sprintf(
+		"🎉 Сбор: %s\n📅 Дата: %s\n🔢 Лимит: %d\n👤 Инициатор: %s\n\n✍️ Записались:\n",
+		r.Name, r.Date, r.Limit, r.Initiator,
+	))
+
 	for i := 0; i < r.Limit; i++ {
 		var line string
 		if i < len(r.SignedUp) {
@@ -116,10 +125,12 @@ func formatRally(r Rally) string {
 		}
 		sb.WriteString(line)
 	}
+
 	sb.WriteString("✏️ Карандашом:\n")
 	for _, user := range r.PenciledIn {
 		sb.WriteString(fmt.Sprintf("%s\n", user))
 	}
+
 	return sb.String()
 }
 
@@ -128,24 +139,34 @@ func buildKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
 
 	if r.Limit > 0 && len(r.SignedUp) < r.Limit {
 		buttons = append(buttons,
-			[]tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("✍️ Записаться ✍️", "sign_up")},
+			[]tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData("✍️ Записаться ✍️", "sign_up"),
+			},
 		)
 	}
+
 	buttons = append(buttons,
-		[]tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("🧽 Отписаться 🧽", "unsign")},
+		[]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("🧽 Отписаться 🧽", "unsign"),
+		},
 	)
+
 	buttons = append(buttons,
-		[]tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("✏️ Карандашом ✏️", "sign_up_pencil")},
+		[]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("✏️ Карандашом ✏️", "sign_up_pencil"),
+		},
 	)
+
 	if userName == r.Initiator {
-		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("❌ Отменить ❌", "cancel"),
-		})
+		buttons = append(buttons,
+			[]tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData("❌ Отменить ❌", "cancel"),
+			},
+		)
 	}
+
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
-
-
 
 func formatCancelledRally(r Rally) string {
 	return "❌ СБОР ОТМЕНЁН ❌\n" + formatRally(r)
@@ -153,59 +174,136 @@ func formatCancelledRally(r Rally) string {
 
 func buildResumeKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
 	buttons := [][]tgbotapi.InlineKeyboardButton{}
+
 	if userName == r.Initiator {
-		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("🔄 Возобновить 🔄", "resume"),
-		})
+		buttons = append(buttons,
+			[]tgbotapi.InlineKeyboardButton{
+				tgbotapi.NewInlineKeyboardButtonData("🔄 Возобновить 🔄", "resume"),
+			},
+		)
 	}
+
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
 
+func loadTitleMap(path string) map[string]string {
+	m := make(map[string]string)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return m
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		parts := strings.SplitN(l, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		oldName := strings.TrimSpace(parts[0])
+		newName := strings.TrimSpace(parts[1])
+		if oldName != "" && newName != "" {
+			m[oldName] = newName
+		}
+	}
+
+	return m
+}
+
 func main() {
-	bot, err := tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_APITOKEN"))
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	token := os.Getenv("TELEGRAM_APITOKEN")
+	if token == "" {
+		log.Panic("TELEGRAM_APITOKEN is empty")
+	}
+
+	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		log.Panic(err)
 	}
-	bot.Debug = true
+
+	bot.Debug = false
+
+	log.Printf("Bot authorized on account %s", bot.Self.UserName)
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
+
 	updates := bot.GetUpdatesChan(u)
 
 	for update := range updates {
 		if update.Message != nil &&
 			(strings.HasPrefix(update.Message.Text, "/сбор") || strings.HasPrefix(update.Message.Text, "/party")) {
+
 			name, limit, date, err := parseCmd(update.Message.Text)
 			if err != nil {
-				bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, err.Error()))
+				_, sendErr := bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, err.Error()))
+				if sendErr != nil {
+					log.Printf("send error: %v", sendErr)
+				}
 				continue
 			}
+
+			initiator := ""
+			if update.Message.From != nil && update.Message.From.UserName != "" {
+				initiator = "@" + update.Message.From.UserName
+			}
+
 			rally := Rally{
 				Name:       name,
 				Date:       date,
 				Limit:      limit,
-				Initiator:  "@" + update.Message.From.UserName,
+				Initiator:  initiator,
 				SignedUp:   []string{},
 				PenciledIn: []string{},
 				MessageID:  0,
 				ChatID:     update.Message.Chat.ID,
 			}
+
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, formatRally(rally))
 			msg.MessageThreadID = update.Message.MessageThreadID
 			msg.ReplyMarkup = buildKeyboard(rally, rally.Initiator)
-			sent, _ := bot.Send(msg)
+
+			sent, err := bot.Send(msg)
+			if err != nil {
+				log.Printf("send error: %v", err)
+				continue
+			}
 			rally.MessageID = sent.MessageID
+
 			continue
 		}
 
 		if update.CallbackQuery != nil {
 			cb := update.CallbackQuery
-			message := cb.Message.Text
-			rally, err := parseRally(message)
-			if err != nil {
+			if cb.Message == nil {
 				continue
 			}
-			user := "@" + cb.From.UserName
+			message := cb.Message.Text
+
+			rally, err := parseRally(message)
+			if err != nil {
+				log.Printf("parse rally error: %v", err)
+				_ = sendSilentCallback(bot, cb.ID)
+				continue
+			}
+
+			user := ""
+			if cb.From != nil && cb.From.UserName != "" {
+				user = "@" + cb.From.UserName
+			}
+			if user == "" {
+				_ = sendSilentCallback(bot, cb.ID)
+				continue
+			}
+
 			changed := false
+
 			switch cb.Data {
 			case "sign_up":
 				found := false
@@ -217,6 +315,7 @@ func main() {
 				}
 				if !found && len(rally.SignedUp) < rally.Limit {
 					rally.SignedUp = append(rally.SignedUp, user)
+
 					var filtered []string
 					for _, u := range rally.PenciledIn {
 						if u != user {
@@ -226,6 +325,7 @@ func main() {
 					rally.PenciledIn = filtered
 					changed = true
 				}
+
 			case "unsign":
 				wasInSigned := false
 				wasInPencil := false
@@ -253,6 +353,7 @@ func main() {
 				if wasInSigned || wasInPencil {
 					changed = true
 				}
+
 			case "sign_up_pencil":
 				found := false
 				for _, u := range rally.SignedUp {
@@ -272,14 +373,23 @@ func main() {
 					rally.PenciledIn = append(rally.PenciledIn, user)
 					changed = true
 				}
+
 			case "cancel":
 				if user == rally.Initiator {
-					edit := tgbotapi.NewEditMessageText(cb.Message.Chat.ID, cb.Message.MessageID, formatCancelledRally(rally))
+					edit := tgbotapi.NewEditMessageText(
+						cb.Message.Chat.ID,
+						cb.Message.MessageID,
+						formatCancelledRally(rally),
+					)
 					kb := buildResumeKeyboard(rally, user)
 					edit.ReplyMarkup = &kb
-					bot.Send(edit)
+					if _, err := bot.Send(edit); err != nil {
+						log.Printf("edit cancel error: %v", err)
+					}
+					_ = sendCallback(bot, cb.ID, "Сбор отменён")
 					continue
 				}
+
 			case "resume":
 				if user == rally.Initiator {
 					lines := strings.Split(cb.Message.Text, "\n")
@@ -289,29 +399,60 @@ func main() {
 					} else {
 						newText = cb.Message.Text
 					}
+
 					resumedRally, err := parseRally(newText)
 					if err != nil {
+						log.Printf("resume parse error: %v", err)
 						resumedRally = rally
 					}
-					edit := tgbotapi.NewEditMessageText(cb.Message.Chat.ID, cb.Message.MessageID, formatRally(resumedRally))
+
+					titleMap := loadTitleMap("titles.txt")
+					if newName, ok := titleMap[resumedRally.Name]; ok {
+						resumedRally.Name = newName
+					}
+
+					edit := tgbotapi.NewEditMessageText(
+						cb.Message.Chat.ID,
+						cb.Message.MessageID,
+						formatRally(resumedRally),
+					)
 					kb := buildKeyboard(resumedRally, user)
 					edit.ReplyMarkup = &kb
-					bot.Send(edit)
-					bot.Request(tgbotapi.NewCallback(cb.ID, "Сбор возобновлён"))
+					if _, err := bot.Send(edit); err != nil {
+						log.Printf("edit resume error: %v", err)
+					}
+					_ = sendCallback(bot, cb.ID, "Сбор возобновлён")
 					continue
 				}
 			}
 
 			if changed {
-				edit := tgbotapi.NewEditMessageText(cb.Message.Chat.ID, cb.Message.MessageID, formatRally(rally))
+				edit := tgbotapi.NewEditMessageText(
+					cb.Message.Chat.ID,
+					cb.Message.MessageID,
+					formatRally(rally),
+				)
 				kb := buildKeyboard(rally, rally.Initiator)
 				edit.ReplyMarkup = &kb
-				_, err := bot.Send(edit)
-				if err != nil {
-					log.Printf("Edit error: %v", err)
+
+				if _, err := bot.Send(edit); err != nil {
+					log.Printf("edit error: %v", err)
 				}
 			}
-			bot.Request(tgbotapi.NewCallback(cb.ID, ""))
+
+			_ = sendSilentCallback(bot, cb.ID)
 		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func sendSilentCallback(bot *tgbotapi.BotAPI, id string) error {
+	_, err := bot.Request(tgbotapi.NewCallback(id, ""))
+	return err
+}
+
+func sendCallback(bot *tgbotapi.BotAPI, id, text string) error {
+	_, err := bot.Request(tgbotapi.NewCallback(id, text))
+	return err
 }
