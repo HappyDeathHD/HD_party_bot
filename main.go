@@ -22,6 +22,18 @@ type Rally struct {
 	ChatID     int64
 }
 
+func displayName(u *tgbotapi.User) string {
+	if u == nil {
+		return ""
+	}
+	if u.UserName != "" {
+		return "@" + u.UserName
+	}
+	first := strings.TrimSpace(u.FirstName)
+	last := strings.TrimSpace(u.LastName)
+	return strings.TrimSpace(last + " " + first)
+}
+
 func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	words := strings.Fields(cmd)
 	if len(words) < 4 {
@@ -88,14 +100,19 @@ func parseRally(message string) (Rally, error) {
 			state = "pencil"
 		case line == "":
 		default:
-			if state == "signed" && len(line) > 0 {
-				parts := strings.Split(line, " ")
-				if len(parts) == 2 && strings.HasPrefix(parts[1], "@") {
-					r.SignedUp = append(r.SignedUp, parts[1])
+			switch state {
+			case "signed":
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) == 2 {
+					id := strings.TrimSpace(parts[1])
+					if id != "" {
+						r.SignedUp = append(r.SignedUp, id)
+					}
 				}
-			} else if state == "pencil" && len(line) > 0 {
-				if strings.HasPrefix(line, "@") {
-					r.PenciledIn = append(r.PenciledIn, line)
+			case "pencil":
+				id := strings.TrimSpace(line)
+				if id != "" {
+					r.PenciledIn = append(r.PenciledIn, id)
 				}
 			}
 		}
@@ -249,10 +266,7 @@ func main() {
 				continue
 			}
 
-			initiator := ""
-			if update.Message.From != nil && update.Message.From.UserName != "" {
-				initiator = "@" + update.Message.From.UserName
-			}
+			initiator := displayName(update.Message.From)
 
 			rally := Rally{
 				Name:       name,
@@ -293,10 +307,7 @@ func main() {
 				continue
 			}
 
-			user := ""
-			if cb.From != nil && cb.From.UserName != "" {
-				user = "@" + cb.From.UserName
-			}
+			user := displayName(cb.From)
 			if user == "" {
 				_ = sendSilentCallback(bot, cb.ID)
 				continue
