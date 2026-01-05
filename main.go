@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/ilpy20/telegram-bot-api/v7"
@@ -20,6 +21,14 @@ type Rally struct {
 	PenciledIn []string
 	MessageID  int
 	ChatID     int64
+}
+
+var titleMap = make(map[string]string)
+var titleMu sync.RWMutex
+
+type ReactionTypeEmoji struct {
+	Type  string `json:"type"`
+	Emoji string `json:"emoji"`
 }
 
 func displayName(u *tgbotapi.User) string {
@@ -37,7 +46,7 @@ func displayName(u *tgbotapi.User) string {
 func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	words := strings.Fields(cmd)
 	if len(words) < 4 {
-		return "", 0, "", fmt.Errorf("Используйте /сбор <название> <лимит> <дата> [время] или /party ...")
+		return "", 0, "", fmt.Errorf("Используйте /сбор <название> <лимит> <дата> [время]")
 	}
 
 	var limIdx int = -1
@@ -203,32 +212,57 @@ func buildResumeKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
 
-func loadTitleMap(path string) map[string]string {
-	m := make(map[string]string)
+func applyTitleReplacements(text *string) {
+	titleMu.Lock()
+	defer titleMu.Unlock()
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return m
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l == "" || strings.HasPrefix(l, "#") {
-			continue
-		}
-		parts := strings.SplitN(l, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		oldName := strings.TrimSpace(parts[0])
-		newName := strings.TrimSpace(parts[1])
-		if oldName != "" && newName != "" {
-			m[oldName] = newName
+	for oldName, newName := range titleMap {
+		if strings.Contains(*text, oldName) {
+			*text = strings.ReplaceAll(*text, oldName, newName)
+			delete(titleMap, oldName)
 		}
 	}
+}
 
-	return m
+func setReaction(bot *tgbotapi.BotAPI, chatID int64, msgID int, emoji string) {
+	reactionsJSON := fmt.Sprintf(`[{"type":"emoji","emoji":"%s"}]`, emoji)
+
+	params := tgbotapi.Params{
+		"chat_id":    strconv.FormatInt(chatID, 10),
+		"message_id": strconv.Itoa(msgID),
+		"reaction":   reactionsJSON,
+	}
+
+	if _, err := bot.MakeRequest("setMessageReaction", params); err != nil {
+		log.Printf("setMessageReaction error: %v", err)
+	}
+}
+
+func handleSudoRn(text string, userName string) (oldName, newName string, ok bool) {
+	if userName != "@BulatHD" {
+		return "", "", false
+	}
+
+	cmdPart := strings.TrimSpace(strings.TrimPrefix(text, "/sudo"))
+	fields := strings.Fields(cmdPart)
+	if len(fields) < 2 || fields[0] != "rn" {
+		return "", "", false
+	}
+
+	rest := strings.TrimSpace(strings.TrimPrefix(cmdPart, "rn"))
+	parts := strings.Split(rest, ":")
+	if len(parts) < 2 {
+		return "", "", false
+	}
+
+	mid := len(parts) / 2
+	oldName = strings.TrimSpace(strings.Join(parts[:mid], ":"))
+	newName = strings.TrimSpace(strings.Join(parts[mid:], ":"))
+	if oldName == "" {
+		return "", "", false
+	}
+
+	return oldName, newName, true
 }
 
 func main() {
@@ -254,43 +288,61 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	for update := range updates {
-		if update.Message != nil &&
-			(strings.HasPrefix(update.Message.Text, "/сбор") || strings.HasPrefix(update.Message.Text, "/party")) {
+		if update.Message != nil {
+			text := strings.TrimSpace(update.Message.Text)
+			chatID := update.Message.Chat.ID
+			threadID := update.Message.MessageThreadID
 
-			name, limit, date, err := parseCmd(update.Message.Text)
-			if err != nil {
-				_, sendErr := bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, err.Error()))
-				if sendErr != nil {
-					log.Printf("send error: %v", sendErr)
+			if strings.HasPrefix(text, "/sudo") {
+				userName := displayName(update.Message.From)
+				oldName, newName, ok := handleSudoRn(text, userName)
+				if ok {
+					titleMu.Lock()
+					titleMap[oldName] = newName
+					titleMu.Unlock()
+					setReaction(bot, chatID, update.Message.MessageID, "👍")
+				} else {
+					setReaction(bot, chatID, update.Message.MessageID, "👎")
 				}
 				continue
 			}
 
-			initiator := displayName(update.Message.From)
+			if strings.HasPrefix(text, "/сбор") || strings.HasPrefix(text, "/party") {
+				name, limit, date, err := parseCmd(text)
+				if err != nil {
+					_, sendErr := bot.Send(tgbotapi.NewMessage(chatID, err.Error()))
+					if sendErr != nil {
+						log.Printf("send error: %v", sendErr)
+					}
+					continue
+				}
 
-			rally := Rally{
-				Name:       name,
-				Date:       date,
-				Limit:      limit,
-				Initiator:  initiator,
-				SignedUp:   []string{},
-				PenciledIn: []string{},
-				MessageID:  0,
-				ChatID:     update.Message.Chat.ID,
-			}
+				initiator := displayName(update.Message.From)
 
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, formatRally(rally))
-			msg.MessageThreadID = update.Message.MessageThreadID
-			msg.ReplyMarkup = buildKeyboard(rally, rally.Initiator)
+				rally := Rally{
+					Name:       name,
+					Date:       date,
+					Limit:      limit,
+					Initiator:  initiator,
+					SignedUp:   []string{},
+					PenciledIn: []string{},
+					MessageID:  0,
+					ChatID:     chatID,
+				}
 
-			sent, err := bot.Send(msg)
-			if err != nil {
-				log.Printf("send error: %v", err)
+				msg := tgbotapi.NewMessage(chatID, formatRally(rally))
+				msg.MessageThreadID = threadID
+				msg.ReplyMarkup = buildKeyboard(rally, rally.Initiator)
+
+				sent, err := bot.Send(msg)
+				if err != nil {
+					log.Printf("send error: %v", err)
+					continue
+				}
+				rally.MessageID = sent.MessageID
+
 				continue
 			}
-			rally.MessageID = sent.MessageID
-
-			continue
 		}
 
 		if update.CallbackQuery != nil {
@@ -299,6 +351,8 @@ func main() {
 				continue
 			}
 			message := cb.Message.Text
+
+			applyTitleReplacements(&message)
 
 			rally, err := parseRally(message)
 			if err != nil {
@@ -411,15 +465,12 @@ func main() {
 						newText = cb.Message.Text
 					}
 
+					applyTitleReplacements(&newText)
+
 					resumedRally, err := parseRally(newText)
 					if err != nil {
 						log.Printf("resume parse error: %v", err)
 						resumedRally = rally
-					}
-
-					titleMap := loadTitleMap("titles.txt")
-					if newName, ok := titleMap[resumedRally.Name]; ok {
-						resumedRally.Name = newName
 					}
 
 					edit := tgbotapi.NewEditMessageText(
