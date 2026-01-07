@@ -23,13 +23,16 @@ type Rally struct {
 	ChatID     int64
 }
 
-var titleMap = make(map[string]string)
-var titleMu sync.RWMutex
-
 type ReactionTypeEmoji struct {
 	Type  string `json:"type"`
 	Emoji string `json:"emoji"`
 }
+
+var banMap = make(map[string]bool)
+var banMu sync.RWMutex
+
+var textReplacements = make(map[string]string)
+var textMu sync.RWMutex
 
 func displayName(u *tgbotapi.User) string {
 	if u == nil {
@@ -43,15 +46,34 @@ func displayName(u *tgbotapi.User) string {
 	return strings.TrimSpace(last + " " + first)
 }
 
+func isBanned(user string) bool {
+	banMu.RLock()
+	res := banMap[user]
+	banMu.RUnlock()
+	return res
+}
+
+func addBan(user string) {
+	banMu.Lock()
+	banMap[user] = true
+	banMu.Unlock()
+}
+
+func removeBan(user string) {
+	banMu.Lock()
+	delete(banMap, user)
+	banMu.Unlock()
+}
+
 func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	words := strings.Fields(cmd)
 	if len(words) < 4 {
 		return "", 0, "", fmt.Errorf("Используйте /сбор <название> <лимит> <дата> [время]")
 	}
 
-	var limIdx int = -1
+	limIdx := -1
 	for i := len(words) - 2; i >= 1; i-- {
-		if l, err := strconv.Atoi(words[i]); err == nil {
+		if l, e := strconv.Atoi(words[i]); e == nil {
 			limIdx = i
 			limit = l
 			break
@@ -94,11 +116,11 @@ func parseRally(message string) (Rally, error) {
 			limitStr := strings.TrimSpace(line[len("Лимит:"):])
 			limit := 0
 			if limitStr != "" {
-				var err error
-				limit, err = strconv.Atoi(limitStr)
+				val, err := strconv.Atoi(limitStr)
 				if err != nil {
 					return Rally{}, fmt.Errorf("invalid limit")
 				}
+				limit = val
 			}
 			r.Limit = limit
 		case strings.HasPrefix(line, "Инициатор:"):
@@ -143,18 +165,17 @@ func formatRally(r Rally) string {
 	))
 
 	for i := 0; i < r.Limit; i++ {
-		var line string
 		if i < len(r.SignedUp) {
-			line = fmt.Sprintf("%d) %s\n", i+1, r.SignedUp[i])
+			sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, r.SignedUp[i]))
 		} else {
-			line = fmt.Sprintf("%d)\n", i+1)
+			sb.WriteString(fmt.Sprintf("%d)\n", i+1))
 		}
-		sb.WriteString(line)
 	}
 
 	sb.WriteString("✏️ Карандашом:\n")
 	for _, user := range r.PenciledIn {
-		sb.WriteString(fmt.Sprintf("%s\n", user))
+		sb.WriteString(user)
+		sb.WriteByte('\n')
 	}
 
 	return sb.String()
@@ -212,16 +233,21 @@ func buildResumeKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
 
-func applyTitleReplacements(text *string) {
-	titleMu.Lock()
-	defer titleMu.Unlock()
+func applyTextReplacementsConsume(text *string) (changed bool) {
+	textMu.Lock()
+	defer textMu.Unlock()
 
-	for oldName, newName := range titleMap {
+	for oldName, newName := range textReplacements {
+		if oldName == "" {
+			continue
+		}
 		if strings.Contains(*text, oldName) {
 			*text = strings.ReplaceAll(*text, oldName, newName)
-			delete(titleMap, oldName)
+			delete(textReplacements, oldName)
+			changed = true
 		}
 	}
+	return changed
 }
 
 func setReaction(bot *tgbotapi.BotAPI, chatID int64, msgID int, emoji string) {
@@ -265,6 +291,147 @@ func handleSudoRn(text string, userName string) (oldName, newName string, ok boo
 	return oldName, newName, true
 }
 
+func handleSudoBanUnban(text, userName string) bool {
+	if userName != "@BulatHD" {
+		return false
+	}
+
+	cmdPart := strings.TrimSpace(strings.TrimPrefix(text, "/sudo"))
+	fields := strings.Fields(cmdPart)
+	if len(fields) < 2 {
+		return false
+	}
+
+	switch fields[0] {
+	case "ban":
+		target := strings.TrimSpace(fields[1])
+		if target == "" {
+			return false
+		}
+		addBan(target)
+		return true
+	case "unban":
+		target := strings.TrimSpace(fields[1])
+		if target == "" {
+			return false
+		}
+		removeBan(target)
+		return true
+	default:
+		return false
+	}
+}
+
+func parseUserInstance(entry string) (base string, n int, ok bool) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return "", 0, false
+	}
+
+	i := strings.LastIndexByte(entry, '+')
+	if i == -1 {
+		return entry, 0, true
+	}
+
+	basePart := strings.TrimSpace(entry[:i])
+	numPart := strings.TrimSpace(entry[i+1:])
+	if basePart == "" {
+		return "", 0, false
+	}
+	if numPart == "" {
+		return basePart, 0, true
+	}
+
+	val, err := strconv.Atoi(numPart)
+	if err != nil || val < 0 {
+		return "", 0, false
+	}
+	return basePart, val, true
+}
+
+func findUserInstances(list []string, user string) (indexes []int, numbers []int) {
+	for i, e := range list {
+		base, n, ok := parseUserInstance(e)
+		if !ok {
+			continue
+		}
+		if base == user {
+			indexes = append(indexes, i)
+			numbers = append(numbers, n)
+		}
+	}
+	return
+}
+
+func addUserInstance(list []string, user string) []string {
+	_, numbers := findUserInstances(list, user)
+	maxN := 0
+	for _, n := range numbers {
+		if n > maxN {
+			maxN = n
+		}
+	}
+
+	if maxN == 0 && len(numbers) == 0 {
+		return append(list, user)
+	}
+	return append(list, fmt.Sprintf("%s +%d", user, maxN+1))
+}
+
+func removeUserInstance(list []string, user string) []string {
+	maxIdx := -1
+	maxN := -1
+
+	for i, e := range list {
+		base, n, ok := parseUserInstance(e)
+		if !ok || base != user {
+			continue
+		}
+		if n > maxN {
+			maxN = n
+			maxIdx = i
+		}
+		if n == 0 && maxN == -1 {
+			maxIdx = i
+			maxN = 0
+		}
+	}
+
+	if maxIdx == -1 {
+		return list
+	}
+
+	res := make([]string, 0, len(list)-1)
+	res = append(res, list[:maxIdx]...)
+	res = append(res, list[maxIdx+1:]...)
+	return res
+}
+
+func filterBanned(list []string) []string {
+	res := make([]string, 0, len(list))
+	for _, e := range list {
+		base, _, ok := parseUserInstance(e)
+		if !ok {
+			res = append(res, e)
+			continue
+		}
+		if isBanned(base) {
+			continue
+		}
+		res = append(res, e)
+	}
+	return res
+}
+
+func editIgnoreNotModified(bot *tgbotapi.BotAPI, edit tgbotapi.EditMessageTextConfig) {
+	if _, err := bot.Send(edit); err != nil {
+		if strings.Contains(err.Error(), "message is not modified") {
+			return
+		}
+		log.Printf("edit error: %v", err)
+	}
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
@@ -279,7 +446,6 @@ func main() {
 	}
 
 	bot.Debug = false
-
 	log.Printf("Bot authorized on account %s", bot.Self.UserName)
 
 	u := tgbotapi.NewUpdate(0)
@@ -295,11 +461,16 @@ func main() {
 
 			if strings.HasPrefix(text, "/sudo") {
 				userName := displayName(update.Message.From)
-				oldName, newName, ok := handleSudoRn(text, userName)
-				if ok {
-					titleMu.Lock()
-					titleMap[oldName] = newName
-					titleMu.Unlock()
+
+				if oldName, newName, ok := handleSudoRn(text, userName); ok {
+					textMu.Lock()
+					textReplacements[oldName] = newName
+					textMu.Unlock()
+					setReaction(bot, chatID, update.Message.MessageID, "👍")
+					continue
+				}
+
+				if handleSudoBanUnban(text, userName) {
 					setReaction(bot, chatID, update.Message.MessageID, "👍")
 				} else {
 					setReaction(bot, chatID, update.Message.MessageID, "👎")
@@ -308,6 +479,11 @@ func main() {
 			}
 
 			if strings.HasPrefix(text, "/сбор") || strings.HasPrefix(text, "/party") {
+				userName := displayName(update.Message.From)
+				if isBanned(userName) {
+					continue
+				}
+
 				name, limit, date, err := parseCmd(text)
 				if err != nil {
 					_, sendErr := bot.Send(tgbotapi.NewMessage(chatID, err.Error()))
@@ -334,12 +510,9 @@ func main() {
 				msg.MessageThreadID = threadID
 				msg.ReplyMarkup = buildKeyboard(rally, rally.Initiator)
 
-				sent, err := bot.Send(msg)
-				if err != nil {
+				if _, err := bot.Send(msg); err != nil {
 					log.Printf("send error: %v", err)
-					continue
 				}
-				rally.MessageID = sent.MessageID
 
 				continue
 			}
@@ -350,97 +523,55 @@ func main() {
 			if cb.Message == nil {
 				continue
 			}
-			message := cb.Message.Text
 
-			applyTitleReplacements(&message)
+			user := displayName(cb.From)
+			if user == "" || isBanned(user) {
+				_ = sendSilentCallback(bot, cb.ID)
+				continue
+			}
 
-			rally, err := parseRally(message)
+			msgText := cb.Message.Text
+
+			_ = applyTextReplacementsConsume(&msgText)
+
+			rally, err := parseRally(msgText)
 			if err != nil {
 				log.Printf("parse rally error: %v", err)
 				_ = sendSilentCallback(bot, cb.ID)
 				continue
 			}
 
-			user := displayName(cb.From)
-			if user == "" {
-				_ = sendSilentCallback(bot, cb.ID)
-				continue
-			}
-
-			changed := false
-
 			switch cb.Data {
 			case "sign_up":
-				found := false
-				for _, u := range rally.SignedUp {
-					if u == user {
-						found = true
-						break
-					}
-				}
-				if !found && len(rally.SignedUp) < rally.Limit {
-					rally.SignedUp = append(rally.SignedUp, user)
+				if rally.Limit > 0 && len(rally.SignedUp) < rally.Limit {
+					rally.SignedUp = addUserInstance(rally.SignedUp, user)
 
-					var filtered []string
+					filtered := make([]string, 0, len(rally.PenciledIn))
 					for _, u := range rally.PenciledIn {
-						if u != user {
+						base, _, ok := parseUserInstance(u)
+						if !ok || base != user {
 							filtered = append(filtered, u)
 						}
 					}
 					rally.PenciledIn = filtered
-					changed = true
 				}
 
 			case "unsign":
-				wasInSigned := false
-				wasInPencil := false
-
-				var filtered []string
-				for _, u := range rally.SignedUp {
-					if u == user {
-						wasInSigned = true
-						continue
-					}
-					filtered = append(filtered, u)
-				}
-				rally.SignedUp = filtered
-
-				var filteredP []string
-				for _, u := range rally.PenciledIn {
-					if u == user {
-						wasInPencil = true
-						continue
-					}
-					filteredP = append(filteredP, u)
-				}
-				rally.PenciledIn = filteredP
-
-				if wasInSigned || wasInPencil {
-					changed = true
-				}
+				rally.SignedUp = removeUserInstance(rally.SignedUp, user)
+				rally.PenciledIn = removeUserInstance(rally.PenciledIn, user)
 
 			case "sign_up_pencil":
-				found := false
-				for _, u := range rally.SignedUp {
-					if u == user {
-						found = true
-						break
-					}
-				}
-				foundP := false
-				for _, u := range rally.PenciledIn {
-					if u == user {
-						foundP = true
-						break
-					}
-				}
-				if !found && !foundP {
-					rally.PenciledIn = append(rally.PenciledIn, user)
-					changed = true
+				_, nums := findUserInstances(rally.SignedUp, user)
+				_, numsP := findUserInstances(rally.PenciledIn, user)
+				if len(nums) == 0 && len(numsP) == 0 {
+					rally.PenciledIn = addUserInstance(rally.PenciledIn, user)
 				}
 
 			case "cancel":
 				if user == rally.Initiator {
+					rally.SignedUp = filterBanned(rally.SignedUp)
+					rally.PenciledIn = filterBanned(rally.PenciledIn)
+
 					edit := tgbotapi.NewEditMessageText(
 						cb.Message.Chat.ID,
 						cb.Message.MessageID,
@@ -448,9 +579,8 @@ func main() {
 					)
 					kb := buildResumeKeyboard(rally, user)
 					edit.ReplyMarkup = &kb
-					if _, err := bot.Send(edit); err != nil {
-						log.Printf("edit cancel error: %v", err)
-					}
+					editIgnoreNotModified(bot, edit)
+
 					_ = sendCallback(bot, cb.ID, "Сбор отменён")
 					continue
 				}
@@ -458,14 +588,12 @@ func main() {
 			case "resume":
 				if user == rally.Initiator {
 					lines := strings.Split(cb.Message.Text, "\n")
-					newText := ""
+					newText := cb.Message.Text
 					if len(lines) > 1 && strings.TrimSpace(lines[0]) == "❌ СБОР ОТМЕНЁН ❌" {
 						newText = strings.Join(lines[1:], "\n")
-					} else {
-						newText = cb.Message.Text
 					}
 
-					applyTitleReplacements(&newText)
+					_ = applyTextReplacementsConsume(&newText)
 
 					resumedRally, err := parseRally(newText)
 					if err != nil {
@@ -473,38 +601,38 @@ func main() {
 						resumedRally = rally
 					}
 
+					resumedRally.SignedUp = filterBanned(resumedRally.SignedUp)
+					resumedRally.PenciledIn = filterBanned(resumedRally.PenciledIn)
+
 					edit := tgbotapi.NewEditMessageText(
 						cb.Message.Chat.ID,
 						cb.Message.MessageID,
 						formatRally(resumedRally),
 					)
-					kb := buildKeyboard(resumedRally, user)
+					kb := buildKeyboard(resumedRally, resumedRally.Initiator)
 					edit.ReplyMarkup = &kb
-					if _, err := bot.Send(edit); err != nil {
-						log.Printf("edit resume error: %v", err)
-					}
+					editIgnoreNotModified(bot, edit)
+
 					_ = sendCallback(bot, cb.ID, "Сбор возобновлён")
 					continue
 				}
 			}
+			rally.SignedUp = filterBanned(rally.SignedUp)
+			rally.PenciledIn = filterBanned(rally.PenciledIn)
 
-			if changed {
+			newText := formatRally(rally)
+			if newText != cb.Message.Text {
 				edit := tgbotapi.NewEditMessageText(
 					cb.Message.Chat.ID,
 					cb.Message.MessageID,
-					formatRally(rally),
+					newText,
 				)
 				kb := buildKeyboard(rally, rally.Initiator)
 				edit.ReplyMarkup = &kb
-
-				if _, err := bot.Send(edit); err != nil {
-					log.Printf("edit error: %v", err)
-				}
+				editIgnoreNotModified(bot, edit)
 			}
-
 			_ = sendSilentCallback(bot, cb.ID)
 		}
-
 		time.Sleep(10 * time.Millisecond)
 	}
 }
