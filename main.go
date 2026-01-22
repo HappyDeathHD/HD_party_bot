@@ -28,11 +28,18 @@ type ReactionTypeEmoji struct {
 	Emoji string `json:"emoji"`
 }
 
-var banMap = make(map[string]bool)
-var banMu sync.RWMutex
+const ADMIN_USERNAME = "@BulatHD"
 
-var textReplacements = make(map[string]string)
-var textMu sync.RWMutex
+var (
+	banList []string
+	banMu   sync.RWMutex
+
+	textReplacements = make(map[string]string)
+	textMu           sync.RWMutex
+
+	deleteOnCancel bool
+	deleteMu       sync.RWMutex
+)
 
 func displayName(u *tgbotapi.User) string {
 	if u == nil {
@@ -46,24 +53,67 @@ func displayName(u *tgbotapi.User) string {
 	return strings.TrimSpace(last + " " + first)
 }
 
+func isAdmin(user string) bool {
+	return user == ADMIN_USERNAME
+}
+
+// ----- banList helpers -----
+
 func isBanned(user string) bool {
 	banMu.RLock()
-	res := banMap[user]
-	banMu.RUnlock()
-	return res
+	defer banMu.RUnlock()
+	for _, u := range banList {
+		if u == user {
+			return true
+		}
+	}
+	return false
 }
 
 func addBan(user string) {
 	banMu.Lock()
-	banMap[user] = true
-	banMu.Unlock()
+	defer banMu.Unlock()
+	for _, u := range banList {
+		if u == user {
+			return
+		}
+	}
+	banList = append(banList, user)
 }
 
 func removeBan(user string) {
 	banMu.Lock()
-	delete(banMap, user)
-	banMu.Unlock()
+	defer banMu.Unlock()
+	res := make([]string, 0, len(banList))
+	for _, u := range banList {
+		if u != user {
+			res = append(res, u)
+		}
+	}
+	banList = res
 }
+
+func clearBans() {
+	banMu.Lock()
+	defer banMu.Unlock()
+	banList = nil
+}
+
+// ----- delete flag helpers -----
+
+func setDeleteOnCancel(v bool) {
+	deleteMu.Lock()
+	defer deleteMu.Unlock()
+	deleteOnCancel = v
+}
+
+func getDeleteOnCancel() bool {
+	deleteMu.RLock()
+	defer deleteMu.RUnlock()
+	return deleteOnCancel
+}
+
+// ----- parsing / formatting -----
 
 func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	words := strings.Fields(cmd)
@@ -80,7 +130,7 @@ func parseCmd(cmd string) (name string, limit int, date string, err error) {
 		}
 	}
 	if limIdx == -1 {
-		return "", 0, "", fmt.Errorf("не найден лимит")
+		return "", 0, "", fmt.Errorf("Не найден лимит")
 	}
 
 	name = strings.Join(words[1:limIdx], " ")
@@ -181,6 +231,8 @@ func formatRally(r Rally) string {
 	return sb.String()
 }
 
+// ----- keyboards -----
+
 func buildKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
 	buttons := [][]tgbotapi.InlineKeyboardButton{}
 
@@ -204,7 +256,7 @@ func buildKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
 		},
 	)
 
-	if userName == r.Initiator {
+	if userName == r.Initiator || isAdmin(userName) {
 		buttons = append(buttons,
 			[]tgbotapi.InlineKeyboardButton{
 				tgbotapi.NewInlineKeyboardButtonData("❌ Отменить ❌", "cancel"),
@@ -222,7 +274,7 @@ func formatCancelledRally(r Rally) string {
 func buildResumeKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
 	buttons := [][]tgbotapi.InlineKeyboardButton{}
 
-	if userName == r.Initiator {
+	if userName == r.Initiator || isAdmin(userName) {
 		buttons = append(buttons,
 			[]tgbotapi.InlineKeyboardButton{
 				tgbotapi.NewInlineKeyboardButtonData("🔄 Возобновить 🔄", "resume"),
@@ -232,6 +284,8 @@ func buildResumeKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup
 
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
+
+// ----- text replacements -----
 
 func applyTextReplacementsConsume(text *string) (changed bool) {
 	textMu.Lock()
@@ -250,6 +304,8 @@ func applyTextReplacementsConsume(text *string) (changed bool) {
 	return changed
 }
 
+// ----- reactions -----
+
 func setReaction(bot *tgbotapi.BotAPI, chatID int64, msgID int, emoji string) {
 	reactionsJSON := fmt.Sprintf(`[{"type":"emoji","emoji":"%s"}]`, emoji)
 
@@ -264,8 +320,10 @@ func setReaction(bot *tgbotapi.BotAPI, chatID int64, msgID int, emoji string) {
 	}
 }
 
+// ----- /sudo handlers -----
+
 func handleSudoRn(text string, userName string) (oldName, newName string, ok bool) {
-	if userName != "@BulatHD" {
+	if !isAdmin(userName) {
 		return "", "", false
 	}
 
@@ -276,14 +334,13 @@ func handleSudoRn(text string, userName string) (oldName, newName string, ok boo
 	}
 
 	rest := strings.TrimSpace(strings.TrimPrefix(cmdPart, "rn"))
-	parts := strings.Split(rest, ":")
+	parts := strings.SplitN(rest, "||", 2)
 	if len(parts) < 2 {
 		return "", "", false
 	}
 
-	mid := len(parts) / 2
-	oldName = strings.TrimSpace(strings.Join(parts[:mid], ":"))
-	newName = strings.TrimSpace(strings.Join(parts[mid:], ":"))
+	oldName = strings.TrimSpace(parts[0])
+	newName = strings.TrimSpace(parts[1])
 	if oldName == "" {
 		return "", "", false
 	}
@@ -291,36 +348,58 @@ func handleSudoRn(text string, userName string) (oldName, newName string, ok boo
 	return oldName, newName, true
 }
 
-func handleSudoBanUnban(text, userName string) bool {
-	if userName != "@BulatHD" {
+
+func handleSudoBanUnbanClearDelete(text, userName string) bool {
+	if !isAdmin(userName) {
 		return false
 	}
 
 	cmdPart := strings.TrimSpace(strings.TrimPrefix(text, "/sudo"))
 	fields := strings.Fields(cmdPart)
-	if len(fields) < 2 {
+	if len(fields) < 1 {
 		return false
 	}
 
 	switch fields[0] {
 	case "ban":
+		if len(fields) < 2 {
+			return false
+		}
 		target := strings.TrimSpace(fields[1])
 		if target == "" {
 			return false
 		}
 		addBan(target)
 		return true
+
 	case "unban":
+		if len(fields) < 2 {
+			return false
+		}
 		target := strings.TrimSpace(fields[1])
 		if target == "" {
 			return false
 		}
 		removeBan(target)
 		return true
+
+	case "clear":
+		clearBans()
+		textMu.Lock()
+		textReplacements = make(map[string]string)
+		textMu.Unlock()
+		return true
+
+	case "delete":
+		setDeleteOnCancel(true)
+		return true
+
 	default:
 		return false
 	}
 }
+
+// ----- user instances -----
 
 func parseUserInstance(entry string) (base string, n int, ok bool) {
 	entry = strings.TrimSpace(entry)
@@ -423,6 +502,8 @@ func filterBanned(list []string) []string {
 	return res
 }
 
+// ----- edit helper -----
+
 func editIgnoreNotModified(bot *tgbotapi.BotAPI, edit tgbotapi.EditMessageTextConfig) {
 	if _, err := bot.Send(edit); err != nil {
 		if strings.Contains(err.Error(), "message is not modified") {
@@ -431,6 +512,20 @@ func editIgnoreNotModified(bot *tgbotapi.BotAPI, edit tgbotapi.EditMessageTextCo
 		log.Printf("edit error: %v", err)
 	}
 }
+
+// ----- callbacks -----
+
+func sendSilentCallback(bot *tgbotapi.BotAPI, id string) error {
+	_, err := bot.Request(tgbotapi.NewCallback(id, ""))
+	return err
+}
+
+func sendCallback(bot *tgbotapi.BotAPI, id, text string) error {
+	_, err := bot.Request(tgbotapi.NewCallback(id, text))
+	return err
+}
+
+// ----- main -----
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -470,7 +565,7 @@ func main() {
 					continue
 				}
 
-				if handleSudoBanUnban(text, userName) {
+				if handleSudoBanUnbanClearDelete(text, userName) {
 					setReaction(bot, chatID, update.Message.MessageID, "👍")
 				} else {
 					setReaction(bot, chatID, update.Message.MessageID, "👎")
@@ -487,6 +582,14 @@ func main() {
 				name, limit, date, err := parseCmd(text)
 				if err != nil {
 					_, sendErr := bot.Send(tgbotapi.NewMessage(chatID, err.Error()))
+					if sendErr != nil {
+						log.Printf("send error: %v", sendErr)
+					}
+					continue
+				}
+
+				if limit > 30 {
+					_, sendErr := bot.Send(tgbotapi.NewMessage(chatID, "Лимит не может быть больше 30"))
 					if sendErr != nil {
 						log.Printf("send error: %v", sendErr)
 					}
@@ -568,7 +671,17 @@ func main() {
 				}
 
 			case "cancel":
-				if user == rally.Initiator {
+				if user == rally.Initiator || isAdmin(user) {
+					if getDeleteOnCancel() && isAdmin(user) {
+						setDeleteOnCancel(false)
+						deleteMsg := tgbotapi.NewDeleteMessage(cb.Message.Chat.ID, cb.Message.MessageID)
+						if _, err := bot.Request(deleteMsg); err != nil {
+							log.Printf("delete message error: %v", err)
+						}
+						_ = sendCallback(bot, cb.ID, "Сообщение удалено")
+						continue
+					}
+
 					rally.SignedUp = filterBanned(rally.SignedUp)
 					rally.PenciledIn = filterBanned(rally.PenciledIn)
 
@@ -586,7 +699,7 @@ func main() {
 				}
 
 			case "resume":
-				if user == rally.Initiator {
+				if user == rally.Initiator || isAdmin(user) {
 					lines := strings.Split(cb.Message.Text, "\n")
 					newText := cb.Message.Text
 					if len(lines) > 1 && strings.TrimSpace(lines[0]) == "❌ СБОР ОТМЕНЁН ❌" {
@@ -617,6 +730,7 @@ func main() {
 					continue
 				}
 			}
+
 			rally.SignedUp = filterBanned(rally.SignedUp)
 			rally.PenciledIn = filterBanned(rally.PenciledIn)
 
@@ -635,14 +749,4 @@ func main() {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-func sendSilentCallback(bot *tgbotapi.BotAPI, id string) error {
-	_, err := bot.Request(tgbotapi.NewCallback(id, ""))
-	return err
-}
-
-func sendCallback(bot *tgbotapi.BotAPI, id, text string) error {
-	_, err := bot.Request(tgbotapi.NewCallback(id, text))
-	return err
 }
