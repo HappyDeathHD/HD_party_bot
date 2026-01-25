@@ -23,12 +23,13 @@ type Rally struct {
 	ChatID     int64
 }
 
-type ReactionTypeEmoji struct {
-	Type  string `json:"type"`
-	Emoji string `json:"emoji"`
-}
-
-const ADMIN_USERNAME = "@BulatHD"
+const (
+	ADMIN_USERNAME  = "@BulatHD"
+	CMD_USAGE       = "Используйте /сбор <название> <лимит> <дата> [время]"
+	LIMIT_MIN       = 2
+	LIMIT_MAX       = 30
+	LIMIT_RANGE_MSG = "Лимит должен быть от 2 до 30"
+)
 
 var (
 	banList []string
@@ -56,8 +57,6 @@ func displayName(u *tgbotapi.User) string {
 func isAdmin(user string) bool {
 	return user == ADMIN_USERNAME
 }
-
-// ----- banList helpers -----
 
 func isBanned(user string) bool {
 	banMu.RLock()
@@ -99,8 +98,6 @@ func clearBans() {
 	banList = nil
 }
 
-// ----- delete flag helpers -----
-
 func setDeleteOnCancel(v bool) {
 	deleteMu.Lock()
 	defer deleteMu.Unlock()
@@ -113,12 +110,10 @@ func getDeleteOnCancel() bool {
 	return deleteOnCancel
 }
 
-// ----- parsing / formatting -----
-
 func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	words := strings.Fields(cmd)
 	if len(words) < 4 {
-		return "", 0, "", fmt.Errorf("Используйте /сбор <название> <лимит> <дата> [время]")
+		return "", 0, "", fmt.Errorf(CMD_USAGE)
 	}
 
 	limIdx := -1
@@ -129,13 +124,21 @@ func parseCmd(cmd string) (name string, limit int, date string, err error) {
 			break
 		}
 	}
-	if limIdx == -1 {
-		return "", 0, "", fmt.Errorf("Не найден лимит")
+	if limIdx == -1 || limIdx < 2 {
+		return "", 0, "", fmt.Errorf(CMD_USAGE)
 	}
 
-	name = strings.Join(words[1:limIdx], " ")
+	name = strings.TrimSpace(strings.Join(words[1:limIdx], " "))
+	if name == "" {
+		return "", 0, "", fmt.Errorf(CMD_USAGE)
+	}
+
 	date = strings.Join(words[limIdx+1:], " ")
-	return
+	if strings.TrimSpace(date) == "" {
+		return "", 0, "", fmt.Errorf(CMD_USAGE)
+	}
+
+	return name, limit, date, nil
 }
 
 func cleanPrefix(line string) string {
@@ -231,8 +234,6 @@ func formatRally(r Rally) string {
 	return sb.String()
 }
 
-// ----- keyboards -----
-
 func buildKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
 	buttons := [][]tgbotapi.InlineKeyboardButton{}
 
@@ -285,8 +286,6 @@ func buildResumeKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup
 	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
 
-// ----- text replacements -----
-
 func applyTextReplacementsConsume(text *string) (changed bool) {
 	textMu.Lock()
 	defer textMu.Unlock()
@@ -304,8 +303,6 @@ func applyTextReplacementsConsume(text *string) (changed bool) {
 	return changed
 }
 
-// ----- reactions -----
-
 func setReaction(bot *tgbotapi.BotAPI, chatID int64, msgID int, emoji string) {
 	reactionsJSON := fmt.Sprintf(`[{"type":"emoji","emoji":"%s"}]`, emoji)
 
@@ -319,8 +316,6 @@ func setReaction(bot *tgbotapi.BotAPI, chatID int64, msgID int, emoji string) {
 		log.Printf("setMessageReaction error: %v", err)
 	}
 }
-
-// ----- /sudo handlers -----
 
 func handleSudoRn(text string, userName string) (oldName, newName string, ok bool) {
 	if !isAdmin(userName) {
@@ -347,7 +342,6 @@ func handleSudoRn(text string, userName string) (oldName, newName string, ok boo
 
 	return oldName, newName, true
 }
-
 
 func handleSudoBanUnbanClearDelete(text, userName string) bool {
 	if !isAdmin(userName) {
@@ -399,8 +393,6 @@ func handleSudoBanUnbanClearDelete(text, userName string) bool {
 	}
 }
 
-// ----- user instances -----
-
 func parseUserInstance(entry string) (base string, n int, ok bool) {
 	entry = strings.TrimSpace(entry)
 	if entry == "" {
@@ -428,62 +420,100 @@ func parseUserInstance(entry string) (base string, n int, ok bool) {
 	return basePart, val, true
 }
 
-func findUserInstances(list []string, user string) (indexes []int, numbers []int) {
-	for i, e := range list {
+func findAllUserNumbers(signed, penciled []string, user string) []int {
+	var res []int
+	for _, e := range signed {
 		base, n, ok := parseUserInstance(e)
-		if !ok {
-			continue
-		}
-		if base == user {
-			indexes = append(indexes, i)
-			numbers = append(numbers, n)
+		if ok && base == user {
+			res = append(res, n)
 		}
 	}
-	return
+	for _, e := range penciled {
+		base, n, ok := parseUserInstance(e)
+		if ok && base == user {
+			res = append(res, n)
+		}
+	}
+	return res
 }
 
-func addUserInstance(list []string, user string) []string {
-	_, numbers := findUserInstances(list, user)
+func findMaxNumberAll(signed, penciled []string, user string) int {
+	nums := findAllUserNumbers(signed, penciled, user)
 	maxN := 0
-	for _, n := range numbers {
+	for _, n := range nums {
 		if n > maxN {
 			maxN = n
 		}
 	}
-
-	if maxN == 0 && len(numbers) == 0 {
-		return append(list, user)
-	}
-	return append(list, fmt.Sprintf("%s +%d", user, maxN+1))
+	return maxN
 }
 
-func removeUserInstance(list []string, user string) []string {
-	maxIdx := -1
+func findMaxInstanceGlobal(signed, penciled []string, user string) (inSigned bool, idx int, n int, ok bool) {
 	maxN := -1
+	inSigned = false
+	idx = -1
 
-	for i, e := range list {
-		base, n, ok := parseUserInstance(e)
-		if !ok || base != user {
+	for i, e := range signed {
+		base, num, okParse := parseUserInstance(e)
+		if !okParse || base != user {
 			continue
 		}
-		if n > maxN {
-			maxN = n
-			maxIdx = i
-		}
-		if n == 0 && maxN == -1 {
-			maxIdx = i
-			maxN = 0
+		if num > maxN {
+			maxN = num
+			inSigned = true
+			idx = i
 		}
 	}
 
-	if maxIdx == -1 {
+	for i, e := range penciled {
+		base, num, okParse := parseUserInstance(e)
+		if !okParse || base != user {
+			continue
+		}
+		if num > maxN {
+			maxN = num
+			inSigned = false
+			idx = i
+		}
+	}
+
+	if idx == -1 {
+		return false, 0, 0, false
+	}
+	return inSigned, idx, maxN, true
+}
+
+func addUserInstanceGlobal(target, signed, penciled []string, user string) []string {
+	nums := findAllUserNumbers(signed, penciled, user)
+	maxN := 0
+	for _, n := range nums {
+		if n > maxN {
+			maxN = n
+		}
+	}
+	if maxN == 0 && len(nums) == 0 {
+		return append(target, user)
+	}
+	return append(target, fmt.Sprintf("%s +%d", user, maxN+1))
+}
+
+func removeAtIndex(list []string, idx int) []string {
+	if idx < 0 || idx >= len(list) {
 		return list
 	}
+	return append(list[:idx], list[idx+1:]...)
+}
 
-	res := make([]string, 0, len(list)-1)
-	res = append(res, list[:maxIdx]...)
-	res = append(res, list[maxIdx+1:]...)
-	return res
+func unsignGlobal(r *Rally, user string) {
+	inSigned, idx, _, ok := findMaxInstanceGlobal(r.SignedUp, r.PenciledIn, user)
+	if !ok {
+		return
+	}
+	if inSigned {
+		r.SignedUp = removeAtIndex(r.SignedUp, idx)
+	} else {
+		r.PenciledIn = removeAtIndex(r.PenciledIn, idx)
+	}
 }
 
 func filterBanned(list []string) []string {
@@ -502,8 +532,6 @@ func filterBanned(list []string) []string {
 	return res
 }
 
-// ----- edit helper -----
-
 func editIgnoreNotModified(bot *tgbotapi.BotAPI, edit tgbotapi.EditMessageTextConfig) {
 	if _, err := bot.Send(edit); err != nil {
 		if strings.Contains(err.Error(), "message is not modified") {
@@ -512,8 +540,6 @@ func editIgnoreNotModified(bot *tgbotapi.BotAPI, edit tgbotapi.EditMessageTextCo
 		log.Printf("edit error: %v", err)
 	}
 }
-
-// ----- callbacks -----
 
 func sendSilentCallback(bot *tgbotapi.BotAPI, id string) error {
 	_, err := bot.Request(tgbotapi.NewCallback(id, ""))
@@ -524,8 +550,6 @@ func sendCallback(bot *tgbotapi.BotAPI, id, text string) error {
 	_, err := bot.Request(tgbotapi.NewCallback(id, text))
 	return err
 }
-
-// ----- main -----
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -576,23 +600,30 @@ func main() {
 			if strings.HasPrefix(text, "/сбор") || strings.HasPrefix(text, "/party") {
 				userName := displayName(update.Message.From)
 				if isBanned(userName) {
+					setReaction(bot, chatID, update.Message.MessageID, "👎")
 					continue
 				}
 
 				name, limit, date, err := parseCmd(text)
 				if err != nil {
-					_, sendErr := bot.Send(tgbotapi.NewMessage(chatID, err.Error()))
+					msg := tgbotapi.NewMessage(chatID, err.Error())
+					msg.MessageThreadID = threadID
+					_, sendErr := bot.Send(msg)
 					if sendErr != nil {
 						log.Printf("send error: %v", sendErr)
 					}
+					setReaction(bot, chatID, update.Message.MessageID, "👎")
 					continue
 				}
 
-				if limit > 30 {
-					_, sendErr := bot.Send(tgbotapi.NewMessage(chatID, "Лимит не может быть больше 30"))
+				if limit < LIMIT_MIN || limit > LIMIT_MAX {
+					msg := tgbotapi.NewMessage(chatID, LIMIT_RANGE_MSG)
+					msg.MessageThreadID = threadID
+					_, sendErr := bot.Send(msg)
 					if sendErr != nil {
 						log.Printf("send error: %v", sendErr)
 					}
+					setReaction(bot, chatID, update.Message.MessageID, "👎")
 					continue
 				}
 
@@ -615,6 +646,9 @@ func main() {
 
 				if _, err := bot.Send(msg); err != nil {
 					log.Printf("send error: %v", err)
+					setReaction(bot, chatID, update.Message.MessageID, "👎")
+				} else {
+					setReaction(bot, chatID, update.Message.MessageID, "👍")
 				}
 
 				continue
@@ -647,28 +681,37 @@ func main() {
 			switch cb.Data {
 			case "sign_up":
 				if rally.Limit > 0 && len(rally.SignedUp) < rally.Limit {
-					rally.SignedUp = addUserInstance(rally.SignedUp, user)
-
-					filtered := make([]string, 0, len(rally.PenciledIn))
-					for _, u := range rally.PenciledIn {
-						base, _, ok := parseUserInstance(u)
+					minIdx := -1
+					minN := -1
+					for i, e := range rally.PenciledIn {
+						base, n, ok := parseUserInstance(e)
 						if !ok || base != user {
-							filtered = append(filtered, u)
+							continue
+						}
+						if minN == -1 || n < minN {
+							minN = n
+							minIdx = i
 						}
 					}
-					rally.PenciledIn = filtered
+				if minIdx != -1 {
+					entry := ""
+					if minN == 0 {
+						entry = user
+					} else {
+						entry = fmt.Sprintf("%s +%d", user, minN)
+					}
+					rally.SignedUp = append(rally.SignedUp, entry)
+					rally.PenciledIn = removeAtIndex(rally.PenciledIn, minIdx)
+				} else {
+					rally.SignedUp = addUserInstanceGlobal(rally.SignedUp, rally.SignedUp, rally.PenciledIn, user)
 				}
+			}
 
 			case "unsign":
-				rally.SignedUp = removeUserInstance(rally.SignedUp, user)
-				rally.PenciledIn = removeUserInstance(rally.PenciledIn, user)
+				unsignGlobal(&rally, user)
 
 			case "sign_up_pencil":
-				_, nums := findUserInstances(rally.SignedUp, user)
-				_, numsP := findUserInstances(rally.PenciledIn, user)
-				if len(nums) == 0 && len(numsP) == 0 {
-					rally.PenciledIn = addUserInstance(rally.PenciledIn, user)
-				}
+				rally.PenciledIn = addUserInstanceGlobal(rally.PenciledIn, rally.SignedUp, rally.PenciledIn, user)
 
 			case "cancel":
 				if user == rally.Initiator || isAdmin(user) {
