@@ -13,14 +13,15 @@ import (
 )
 
 type Rally struct {
-	Name       string
-	Date       string
-	Limit      int
-	Initiator  string
-	SignedUp   []string
-	PenciledIn []string
-	MessageID  int
-	ChatID     int64
+	Name        string
+	Date        string
+	Limit       int
+	Initiator   string
+	SignedUp    []string
+	WaitingList []string
+	PenciledIn  []string
+	MessageID   int
+	ChatID      int64
 }
 
 const (
@@ -29,6 +30,8 @@ const (
 	LIMIT_MIN       = 2
 	LIMIT_MAX       = 30
 	LIMIT_RANGE_MSG = "Лимит должен быть от 2 до 30"
+
+	MAX_PLUS_FRIENDS = 4
 )
 
 var (
@@ -144,7 +147,7 @@ func parseCmd(cmd string) (name string, limit int, date string, err error) {
 func cleanPrefix(line string) string {
 	line = strings.TrimSpace(line)
 	for _, prefix := range []string{
-		"🎉", "📅", "🔢", "👤", "✍️", "✏️", "❌",
+		"🎉", "📅", "🔢", "👤", "✍️", "✏️", "❌", "⏳",
 	} {
 		if strings.HasPrefix(line, prefix) {
 			line = strings.TrimSpace(line[len(prefix):])
@@ -182,6 +185,8 @@ func parseRally(message string) (Rally, error) {
 			state = "signed"
 		case strings.HasPrefix(line, "Карандашом:"):
 			state = "pencil"
+		case strings.HasPrefix(line, "Лист ожидания:"):
+			state = "waiting"
 		case line == "":
 		default:
 			switch state {
@@ -191,6 +196,14 @@ func parseRally(message string) (Rally, error) {
 					id := strings.TrimSpace(parts[1])
 					if id != "" {
 						r.SignedUp = append(r.SignedUp, id)
+					}
+				}
+			case "waiting":
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) == 2 {
+					id := strings.TrimSpace(parts[1])
+					if id != "" {
+						r.WaitingList = append(r.WaitingList, id)
 					}
 				}
 			case "pencil":
@@ -217,15 +230,23 @@ func formatRally(r Rally) string {
 		r.Name, r.Date, r.Limit, r.Initiator,
 	))
 
+	mainCount := len(r.SignedUp)
 	for i := 0; i < r.Limit; i++ {
-		if i < len(r.SignedUp) {
+		if i < mainCount {
 			sb.WriteString(fmt.Sprintf("%d) %s\n", i+1, r.SignedUp[i]))
 		} else {
 			sb.WriteString(fmt.Sprintf("%d)\n", i+1))
 		}
 	}
 
-	sb.WriteString("✏️ Карандашом:\n")
+	if len(r.WaitingList) > 0 {
+		sb.WriteString("\n⏳ Лист ожидания:\n")
+		for i, user := range r.WaitingList {
+			sb.WriteString(fmt.Sprintf("%d) %s\n", r.Limit+i+1, user))
+		}
+	}
+
+	sb.WriteString("\n✏️ Карандашом:\n")
 	for _, user := range r.PenciledIn {
 		sb.WriteString(user)
 		sb.WriteByte('\n')
@@ -237,13 +258,11 @@ func formatRally(r Rally) string {
 func buildKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
 	buttons := [][]tgbotapi.InlineKeyboardButton{}
 
-	if r.Limit > 0 && len(r.SignedUp) < r.Limit {
-		buttons = append(buttons,
-			[]tgbotapi.InlineKeyboardButton{
-				tgbotapi.NewInlineKeyboardButtonData("✍️ Записаться ✍️", "sign_up"),
-			},
-		)
-	}
+	buttons = append(buttons,
+		[]tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("✍️ Записаться ✍️", "sign_up"),
+		},
+	)
 
 	buttons = append(buttons,
 		[]tgbotapi.InlineKeyboardButton{
@@ -420,9 +439,15 @@ func parseUserInstance(entry string) (base string, n int, ok bool) {
 	return basePart, val, true
 }
 
-func findAllUserNumbers(signed, penciled []string, user string) []int {
+func findAllUserNumbers(signed, waiting, penciled []string, user string) []int {
 	var res []int
 	for _, e := range signed {
+		base, n, ok := parseUserInstance(e)
+		if ok && base == user {
+			res = append(res, n)
+		}
+	}
+	for _, e := range waiting {
 		base, n, ok := parseUserInstance(e)
 		if ok && base == user {
 			res = append(res, n)
@@ -437,8 +462,8 @@ func findAllUserNumbers(signed, penciled []string, user string) []int {
 	return res
 }
 
-func findMaxNumberAll(signed, penciled []string, user string) int {
-	nums := findAllUserNumbers(signed, penciled, user)
+func findMaxNumberAll(signed, waiting, penciled []string, user string) int {
+	nums := findAllUserNumbers(signed, waiting, penciled, user)
 	maxN := 0
 	for _, n := range nums {
 		if n > maxN {
@@ -448,9 +473,9 @@ func findMaxNumberAll(signed, penciled []string, user string) int {
 	return maxN
 }
 
-func findMaxInstanceGlobal(signed, penciled []string, user string) (inSigned bool, idx int, n int, ok bool) {
+func findMaxInstanceGlobal(signed, waiting, penciled []string, user string) (where string, idx int, n int, ok bool) {
 	maxN := -1
-	inSigned = false
+	where = ""
 	idx = -1
 
 	for i, e := range signed {
@@ -460,7 +485,19 @@ func findMaxInstanceGlobal(signed, penciled []string, user string) (inSigned boo
 		}
 		if num > maxN {
 			maxN = num
-			inSigned = true
+			where = "signed"
+			idx = i
+		}
+	}
+
+	for i, e := range waiting {
+		base, num, okParse := parseUserInstance(e)
+		if !okParse || base != user {
+			continue
+		}
+		if num > maxN {
+			maxN = num
+			where = "waiting"
 			idx = i
 		}
 	}
@@ -472,24 +509,27 @@ func findMaxInstanceGlobal(signed, penciled []string, user string) (inSigned boo
 		}
 		if num > maxN {
 			maxN = num
-			inSigned = false
+			where = "pencil"
 			idx = i
 		}
 	}
 
 	if idx == -1 {
-		return false, 0, 0, false
+		return "", 0, 0, false
 	}
-	return inSigned, idx, maxN, true
+	return where, idx, maxN, true
 }
 
-func addUserInstanceGlobal(target, signed, penciled []string, user string) []string {
-	nums := findAllUserNumbers(signed, penciled, user)
+func addUserInstanceGlobal(target, signed, waiting, penciled []string, user string) []string {
+	nums := findAllUserNumbers(signed, waiting, penciled, user)
 	maxN := 0
 	for _, n := range nums {
 		if n > maxN {
 			maxN = n
 		}
+	}
+	if maxN >= MAX_PLUS_FRIENDS {
+		return target
 	}
 	if maxN == 0 && len(nums) == 0 {
 		return append(target, user)
@@ -505,13 +545,21 @@ func removeAtIndex(list []string, idx int) []string {
 }
 
 func unsignGlobal(r *Rally, user string) {
-	inSigned, idx, _, ok := findMaxInstanceGlobal(r.SignedUp, r.PenciledIn, user)
+	where, idx, _, ok := findMaxInstanceGlobal(r.SignedUp, r.WaitingList, r.PenciledIn, user)
 	if !ok {
 		return
 	}
-	if inSigned {
+	switch where {
+	case "signed":
 		r.SignedUp = removeAtIndex(r.SignedUp, idx)
-	} else {
+		if len(r.WaitingList) > 0 {
+			firstWaiting := r.WaitingList[0]
+			r.WaitingList = r.WaitingList[1:]
+			r.SignedUp = append(r.SignedUp, firstWaiting)
+		}
+	case "waiting":
+		r.WaitingList = removeAtIndex(r.WaitingList, idx)
+	case "pencil":
 		r.PenciledIn = removeAtIndex(r.PenciledIn, idx)
 	}
 }
@@ -630,14 +678,15 @@ func main() {
 				initiator := displayName(update.Message.From)
 
 				rally := Rally{
-					Name:       name,
-					Date:       date,
-					Limit:      limit,
-					Initiator:  initiator,
-					SignedUp:   []string{},
-					PenciledIn: []string{},
-					MessageID:  0,
-					ChatID:     chatID,
+					Name:        name,
+					Date:        date,
+					Limit:       limit,
+					Initiator:   initiator,
+					SignedUp:    []string{},
+					WaitingList: []string{},
+					PenciledIn:  []string{},
+					MessageID:   0,
+					ChatID:      chatID,
 				}
 
 				msg := tgbotapi.NewMessage(chatID, formatRally(rally))
@@ -680,19 +729,19 @@ func main() {
 
 			switch cb.Data {
 			case "sign_up":
-				if rally.Limit > 0 && len(rally.SignedUp) < rally.Limit {
-					minIdx := -1
-					minN := -1
-					for i, e := range rally.PenciledIn {
-						base, n, ok := parseUserInstance(e)
-						if !ok || base != user {
-							continue
-						}
-						if minN == -1 || n < minN {
-							minN = n
-							minIdx = i
-						}
+				minIdx := -1
+				minN := -1
+				for i, e := range rally.PenciledIn {
+					base, n, ok := parseUserInstance(e)
+					if !ok || base != user {
+						continue
 					}
+					if minN == -1 || n < minN {
+						minN = n
+						minIdx = i
+					}
+				}
+
 				if minIdx != -1 {
 					entry := ""
 					if minN == 0 {
@@ -700,18 +749,36 @@ func main() {
 					} else {
 						entry = fmt.Sprintf("%s +%d", user, minN)
 					}
-					rally.SignedUp = append(rally.SignedUp, entry)
+					if len(rally.SignedUp) < rally.Limit {
+						rally.SignedUp = append(rally.SignedUp, entry)
+					} else {
+						rally.WaitingList = append(rally.WaitingList, entry)
+					}
 					rally.PenciledIn = removeAtIndex(rally.PenciledIn, minIdx)
 				} else {
-					rally.SignedUp = addUserInstanceGlobal(rally.SignedUp, rally.SignedUp, rally.PenciledIn, user)
+					currentMax := findMaxNumberAll(rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
+					if currentMax >= MAX_PLUS_FRIENDS {
+						_ = sendCallback(bot, cb.ID, fmt.Sprintf("Максимум %d друзей уже записано", MAX_PLUS_FRIENDS))
+						break
+					}
+
+					if len(rally.SignedUp) < rally.Limit {
+						rally.SignedUp = addUserInstanceGlobal(rally.SignedUp, rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
+					} else {
+						rally.WaitingList = addUserInstanceGlobal(rally.WaitingList, rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
+					}
 				}
-			}
 
 			case "unsign":
 				unsignGlobal(&rally, user)
 
 			case "sign_up_pencil":
-				rally.PenciledIn = addUserInstanceGlobal(rally.PenciledIn, rally.SignedUp, rally.PenciledIn, user)
+				currentMax := findMaxNumberAll(rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
+				if currentMax >= MAX_PLUS_FRIENDS {
+					_ = sendCallback(bot, cb.ID, fmt.Sprintf("Максимум %d друзей уже записано", MAX_PLUS_FRIENDS))
+					break
+				}
+				rally.PenciledIn = addUserInstanceGlobal(rally.PenciledIn, rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
 
 			case "cancel":
 				if user == rally.Initiator || isAdmin(user) {
@@ -726,6 +793,7 @@ func main() {
 					}
 
 					rally.SignedUp = filterBanned(rally.SignedUp)
+					rally.WaitingList = filterBanned(rally.WaitingList)
 					rally.PenciledIn = filterBanned(rally.PenciledIn)
 
 					edit := tgbotapi.NewEditMessageText(
@@ -758,6 +826,7 @@ func main() {
 					}
 
 					resumedRally.SignedUp = filterBanned(resumedRally.SignedUp)
+					resumedRally.WaitingList = filterBanned(resumedRally.WaitingList)
 					resumedRally.PenciledIn = filterBanned(resumedRally.PenciledIn)
 
 					edit := tgbotapi.NewEditMessageText(
@@ -775,6 +844,7 @@ func main() {
 			}
 
 			rally.SignedUp = filterBanned(rally.SignedUp)
+			rally.WaitingList = filterBanned(rally.WaitingList)
 			rally.PenciledIn = filterBanned(rally.PenciledIn)
 
 			newText := formatRally(rally)
