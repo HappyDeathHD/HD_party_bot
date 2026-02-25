@@ -1,15 +1,21 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+	"syscall"
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "net/http"
 
-	tgbotapi "github.com/ilpy20/telegram-bot-api/v7"
+	"github.com/mymmrac/telego"
+	tu "github.com/mymmrac/telego/telegoutil"
 )
 
 type Rally struct {
@@ -25,32 +31,29 @@ type Rally struct {
 }
 
 const (
-	ADMIN_USERNAME  = "@BulatHD"
-	CMD_USAGE       = "Используйте /сбор <название> <лимит> <дата> [время]"
-	LIMIT_MIN       = 2
-	LIMIT_MAX       = 30
-	LIMIT_RANGE_MSG = "Лимит должен быть от 2 до 30"
-
+	ADMIN_USERNAME   = "@BulatHD"
+	CMD_USAGE        = "Используйте /сбор <название> <лимит> <дата> [время]"
+	LIMIT_MIN        = 2
+	LIMIT_MAX        = 30
+	LIMIT_RANGE_MSG  = "Лимит должен быть от 2 до 30"
 	MAX_PLUS_FRIENDS = 4
 )
 
 var (
-	banList []string
-	banMu   sync.RWMutex
-
+	banList          []string
+	banMu            sync.RWMutex
 	textReplacements = make(map[string]string)
 	textMu           sync.RWMutex
-
-	deleteOnCancel bool
-	deleteMu       sync.RWMutex
+	deleteOnCancel   bool
+	deleteMu         sync.RWMutex
 )
 
-func displayName(u *tgbotapi.User) string {
+func displayName(u *telego.User) string {
 	if u == nil {
 		return ""
 	}
-	if u.UserName != "" {
-		return "@" + u.UserName
+	if u.Username != "" {
+		return "@" + u.Username
 	}
 	first := strings.TrimSpace(u.FirstName)
 	last := strings.TrimSpace(u.LastName)
@@ -118,7 +121,6 @@ func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	if len(words) < 4 {
 		return "", 0, "", fmt.Errorf(CMD_USAGE)
 	}
-
 	limIdx := -1
 	for i := len(words) - 2; i >= 1; i-- {
 		if l, e := strconv.Atoi(words[i]); e == nil {
@@ -130,25 +132,20 @@ func parseCmd(cmd string) (name string, limit int, date string, err error) {
 	if limIdx == -1 || limIdx < 2 {
 		return "", 0, "", fmt.Errorf(CMD_USAGE)
 	}
-
 	name = strings.TrimSpace(strings.Join(words[1:limIdx], " "))
 	if name == "" {
 		return "", 0, "", fmt.Errorf(CMD_USAGE)
 	}
-
 	date = strings.Join(words[limIdx+1:], " ")
 	if strings.TrimSpace(date) == "" {
 		return "", 0, "", fmt.Errorf(CMD_USAGE)
 	}
-
 	return name, limit, date, nil
 }
 
 func cleanPrefix(line string) string {
 	line = strings.TrimSpace(line)
-	for _, prefix := range []string{
-		"🎉", "📅", "🔢", "👤", "✍️", "✏️", "❌", "⏳",
-	} {
+	for _, prefix := range []string{"🎉", "📅", "🔢", "👤", "✍️", "✏️", "❌", "⏳"} {
 		if strings.HasPrefix(line, prefix) {
 			line = strings.TrimSpace(line[len(prefix):])
 		}
@@ -160,7 +157,6 @@ func parseRally(message string) (Rally, error) {
 	lines := strings.Split(message, "\n")
 	r := Rally{}
 	state := ""
-
 	for i := 0; i < len(lines); i++ {
 		line := cleanPrefix(strings.TrimSpace(lines[i]))
 		switch {
@@ -188,22 +184,19 @@ func parseRally(message string) (Rally, error) {
 		case strings.HasPrefix(line, "Лист ожидания:"):
 			state = "waiting"
 		case line == "":
+			continue
 		default:
 			switch state {
-			case "signed":
+			case "signed", "waiting":
 				parts := strings.SplitN(line, " ", 2)
 				if len(parts) == 2 {
 					id := strings.TrimSpace(parts[1])
 					if id != "" {
-						r.SignedUp = append(r.SignedUp, id)
-					}
-				}
-			case "waiting":
-				parts := strings.SplitN(line, " ", 2)
-				if len(parts) == 2 {
-					id := strings.TrimSpace(parts[1])
-					if id != "" {
-						r.WaitingList = append(r.WaitingList, id)
+						if state == "signed" {
+							r.SignedUp = append(r.SignedUp, id)
+						} else {
+							r.WaitingList = append(r.WaitingList, id)
+						}
 					}
 				}
 			case "pencil":
@@ -214,22 +207,18 @@ func parseRally(message string) (Rally, error) {
 			}
 		}
 	}
-
 	if r.Name == "" || r.Date == "" || r.Initiator == "" {
 		return Rally{}, fmt.Errorf("missing fields in structure")
 	}
-
 	return r, nil
 }
 
 func formatRally(r Rally) string {
 	var sb strings.Builder
-
 	sb.WriteString(fmt.Sprintf(
 		"🎉 Сбор: %s\n📅 Дата: %s\n🔢 Лимит: %d\n👤 Инициатор: %s\n\n✍️ Записались:\n",
 		r.Name, r.Date, r.Limit, r.Initiator,
 	))
-
 	mainCount := len(r.SignedUp)
 	for i := 0; i < r.Limit; i++ {
 		if i < mainCount {
@@ -238,77 +227,67 @@ func formatRally(r Rally) string {
 			sb.WriteString(fmt.Sprintf("%d)\n", i+1))
 		}
 	}
-
 	if len(r.WaitingList) > 0 {
 		sb.WriteString("\n⏳ Лист ожидания:\n")
 		for i, user := range r.WaitingList {
 			sb.WriteString(fmt.Sprintf("%d) %s\n", r.Limit+i+1, user))
 		}
 	}
-
 	sb.WriteString("\n✏️ Карандашом:\n")
 	for _, user := range r.PenciledIn {
-		sb.WriteString(user)
-		sb.WriteByte('\n')
+		sb.WriteString(user + "\n")
 	}
-
 	return sb.String()
 }
 
-func buildKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
-	buttons := [][]tgbotapi.InlineKeyboardButton{}
-
-	buttons = append(buttons,
-		[]tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("✍️ Записаться ✍️", "sign_up"),
-		},
-	)
-
-	buttons = append(buttons,
-		[]tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("🧽 Отписаться 🧽", "unsign"),
-		},
-	)
-
-	buttons = append(buttons,
-		[]tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("✏️ Карандашом ✏️", "sign_up_pencil"),
-		},
-	)
-
-	if userName == r.Initiator || isAdmin(userName) {
-		buttons = append(buttons,
-			[]tgbotapi.InlineKeyboardButton{
-				tgbotapi.NewInlineKeyboardButtonData("❌ Отменить ❌", "cancel"),
-			},
-		)
+func buildKeyboard(r Rally, userName string) *telego.InlineKeyboardMarkup {
+	buttons := [][]telego.InlineKeyboardButton{
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("✍️ Записаться ✍️").
+				WithCallbackData("sign_up").
+				WithStyle("success"),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("🧽 Отписаться 🧽").
+				WithCallbackData("unsign"),
+		),
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("✏️ Карандашом ✏️").
+				WithCallbackData("sign_up_pencil").
+				WithStyle("primary"),
+		),
 	}
+	if userName == r.Initiator || isAdmin(userName) {
+		buttons = append(buttons, tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("❌ Отменить ❌").
+				WithCallbackData("cancel").
+				WithStyle("danger"),
+		))
+	}
+	return tu.InlineKeyboard(buttons...)
+}
 
-	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
+func buildResumeKeyboard(r Rally, userName string) *telego.InlineKeyboardMarkup {
+	if userName != r.Initiator && !isAdmin(userName) {
+		return nil
+	}
+	return tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("🔄 Возобновить 🔄").
+				WithCallbackData("resume").
+				WithStyle("primary"),
+		),
+	)
 }
 
 func formatCancelledRally(r Rally) string {
 	return "❌ СБОР ОТМЕНЁН ❌\n" + formatRally(r)
 }
 
-func buildResumeKeyboard(r Rally, userName string) tgbotapi.InlineKeyboardMarkup {
-	buttons := [][]tgbotapi.InlineKeyboardButton{}
-
-	if userName == r.Initiator || isAdmin(userName) {
-		buttons = append(buttons,
-			[]tgbotapi.InlineKeyboardButton{
-				tgbotapi.NewInlineKeyboardButtonData("🔄 Возобновить 🔄", "resume"),
-			},
-		)
-	}
-
-	return tgbotapi.NewInlineKeyboardMarkup(buttons...)
-}
-
-func applyTextReplacementsConsume(text *string) (changed bool) {
+func applyTextReplacementsConsume(text *string) bool {
 	textMu.Lock()
 	defer textMu.Unlock()
-
+	changed := false
 	for oldName, newName := range textReplacements {
 		if oldName == "" {
 			continue
@@ -322,94 +301,51 @@ func applyTextReplacementsConsume(text *string) (changed bool) {
 	return changed
 }
 
-func setReaction(bot *tgbotapi.BotAPI, chatID int64, msgID int, emoji string) {
-	reactionsJSON := fmt.Sprintf(`[{"type":"emoji","emoji":"%s"}]`, emoji)
+func setReaction(bot *telego.Bot, ctx context.Context, chatID int64, msgID int, emoji string) {
+	token := bot.Token()
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/setMessageReaction", token)
 
-	params := tgbotapi.Params{
-		"chat_id":    strconv.FormatInt(chatID, 10),
-		"message_id": strconv.Itoa(msgID),
-		"reaction":   reactionsJSON,
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": msgID,
+		"reaction": []map[string]string{
+			{
+				"type":  "emoji",
+				"emoji": emoji,
+			},
+		},
 	}
 
-	if _, err := bot.MakeRequest("setMessageReaction", params); err != nil {
-		log.Printf("setMessageReaction error: %v", err)
+	bodyBytes, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, _ := client.Do(req)
+	if resp != nil {
+		defer resp.Body.Close()
 	}
 }
 
-func handleSudoRn(text string, userName string) (oldName, newName string, ok bool) {
-	if !isAdmin(userName) {
-		return "", "", false
+func editIgnoreNotModified(bot *telego.Bot, ctx context.Context, editParams *telego.EditMessageTextParams) {
+	_, err := bot.EditMessageText(ctx, editParams)
+	if err != nil && !strings.Contains(err.Error(), "message is not modified") {
+		log.Printf("edit error: %v", err)
 	}
-
-	cmdPart := strings.TrimSpace(strings.TrimPrefix(text, "/sudo"))
-	fields := strings.Fields(cmdPart)
-	if len(fields) < 2 || fields[0] != "rn" {
-		return "", "", false
-	}
-
-	rest := strings.TrimSpace(strings.TrimPrefix(cmdPart, "rn"))
-	parts := strings.SplitN(rest, "||", 2)
-	if len(parts) < 2 {
-		return "", "", false
-	}
-
-	oldName = strings.TrimSpace(parts[0])
-	newName = strings.TrimSpace(parts[1])
-	if oldName == "" {
-		return "", "", false
-	}
-
-	return oldName, newName, true
 }
 
-func handleSudoBanUnbanClearDelete(text, userName string) bool {
-	if !isAdmin(userName) {
-		return false
-	}
+func sendSilentCallback(bot *telego.Bot, ctx context.Context, callbackID string) {
+	_ = bot.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
+		CallbackQueryID: callbackID,
+	})
+}
 
-	cmdPart := strings.TrimSpace(strings.TrimPrefix(text, "/sudo"))
-	fields := strings.Fields(cmdPart)
-	if len(fields) < 1 {
-		return false
-	}
-
-	switch fields[0] {
-	case "ban":
-		if len(fields) < 2 {
-			return false
-		}
-		target := strings.TrimSpace(fields[1])
-		if target == "" {
-			return false
-		}
-		addBan(target)
-		return true
-
-	case "unban":
-		if len(fields) < 2 {
-			return false
-		}
-		target := strings.TrimSpace(fields[1])
-		if target == "" {
-			return false
-		}
-		removeBan(target)
-		return true
-
-	case "clear":
-		clearBans()
-		textMu.Lock()
-		textReplacements = make(map[string]string)
-		textMu.Unlock()
-		return true
-
-	case "delete":
-		setDeleteOnCancel(true)
-		return true
-
-	default:
-		return false
-	}
+func sendCallback(bot *telego.Bot, ctx context.Context, callbackID, text string) {
+	_ = bot.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
+		CallbackQueryID: callbackID,
+		Text:            text,
+	})
 }
 
 func parseUserInstance(entry string) (base string, n int, ok bool) {
@@ -417,12 +353,10 @@ func parseUserInstance(entry string) (base string, n int, ok bool) {
 	if entry == "" {
 		return "", 0, false
 	}
-
 	i := strings.LastIndexByte(entry, '+')
 	if i == -1 {
 		return entry, 0, true
 	}
-
 	basePart := strings.TrimSpace(entry[:i])
 	numPart := strings.TrimSpace(entry[i+1:])
 	if basePart == "" {
@@ -431,7 +365,6 @@ func parseUserInstance(entry string) (base string, n int, ok bool) {
 	if numPart == "" {
 		return basePart, 0, true
 	}
-
 	val, err := strconv.Atoi(numPart)
 	if err != nil || val < 0 {
 		return "", 0, false
@@ -477,7 +410,6 @@ func findMaxInstanceGlobal(signed, waiting, penciled []string, user string) (whe
 	maxN := -1
 	where = ""
 	idx = -1
-
 	for i, e := range signed {
 		base, num, okParse := parseUserInstance(e)
 		if !okParse || base != user {
@@ -489,7 +421,6 @@ func findMaxInstanceGlobal(signed, waiting, penciled []string, user string) (whe
 			idx = i
 		}
 	}
-
 	for i, e := range waiting {
 		base, num, okParse := parseUserInstance(e)
 		if !okParse || base != user {
@@ -501,7 +432,6 @@ func findMaxInstanceGlobal(signed, waiting, penciled []string, user string) (whe
 			idx = i
 		}
 	}
-
 	for i, e := range penciled {
 		base, num, okParse := parseUserInstance(e)
 		if !okParse || base != user {
@@ -513,7 +443,6 @@ func findMaxInstanceGlobal(signed, waiting, penciled []string, user string) (whe
 			idx = i
 		}
 	}
-
 	if idx == -1 {
 		return "", 0, 0, false
 	}
@@ -580,23 +509,70 @@ func filterBanned(list []string) []string {
 	return res
 }
 
-func editIgnoreNotModified(bot *tgbotapi.BotAPI, edit tgbotapi.EditMessageTextConfig) {
-	if _, err := bot.Send(edit); err != nil {
-		if strings.Contains(err.Error(), "message is not modified") {
-			return
-		}
-		log.Printf("edit error: %v", err)
+func handleSudoRn(text string, userName string) (oldName, newName string, ok bool) {
+	if !isAdmin(userName) {
+		return "", "", false
 	}
+	cmdPart := strings.TrimSpace(strings.TrimPrefix(text, "/sudo"))
+	fields := strings.Fields(cmdPart)
+	if len(fields) < 2 || fields[0] != "rn" {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(cmdPart, "rn"))
+	parts := strings.SplitN(rest, "||", 2)
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	oldName = strings.TrimSpace(parts[0])
+	newName = strings.TrimSpace(parts[1])
+	if oldName == "" {
+		return "", "", false
+	}
+	return oldName, newName, true
 }
 
-func sendSilentCallback(bot *tgbotapi.BotAPI, id string) error {
-	_, err := bot.Request(tgbotapi.NewCallback(id, ""))
-	return err
-}
-
-func sendCallback(bot *tgbotapi.BotAPI, id, text string) error {
-	_, err := bot.Request(tgbotapi.NewCallback(id, text))
-	return err
+func handleSudoBanUnbanClearDelete(text, userName string) bool {
+	if !isAdmin(userName) {
+		return false
+	}
+	cmdPart := strings.TrimSpace(strings.TrimPrefix(text, "/sudo"))
+	fields := strings.Fields(cmdPart)
+	if len(fields) < 1 {
+		return false
+	}
+	switch fields[0] {
+	case "ban":
+		if len(fields) < 2 {
+			return false
+		}
+		target := strings.TrimSpace(fields[1])
+		if target == "" {
+			return false
+		}
+		addBan(target)
+		return true
+	case "unban":
+		if len(fields) < 2 {
+			return false
+		}
+		target := strings.TrimSpace(fields[1])
+		if target == "" {
+			return false
+		}
+		removeBan(target)
+		return true
+	case "clear":
+		clearBans()
+		textMu.Lock()
+		textReplacements = make(map[string]string)
+		textMu.Unlock()
+		return true
+	case "delete":
+		setDeleteOnCancel(true)
+		return true
+	default:
+		return false
+	}
 }
 
 func main() {
@@ -607,125 +583,142 @@ func main() {
 		log.Panic("TELEGRAM_APITOKEN is empty")
 	}
 
-	bot, err := tgbotapi.NewBotAPI(token)
+	bot, err := telego.NewBot(token)
 	if err != nil {
 		log.Panic(err)
 	}
 
-	bot.Debug = false
-	log.Printf("Bot authorized on account %s", bot.Self.UserName)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
+	me, err := bot.GetMe(ctx)
+	if err != nil {
+		log.Panic(err)
+	}
+	log.Printf("Bot authorized on account @%s", me.Username)
 
-	updates := bot.GetUpdatesChan(u)
+	updates, err := bot.UpdatesViaLongPolling(ctx, nil)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		cancel()
+	}()
 
 	for update := range updates {
 		if update.Message != nil {
-			text := strings.TrimSpace(update.Message.Text)
-			chatID := update.Message.Chat.ID
-			threadID := update.Message.MessageThreadID
+			msg := update.Message
+			text := strings.TrimSpace(msg.Text)
+			chatID := msg.Chat.ID
+			threadID := msg.MessageThreadID
+			userName := displayName(msg.From)
 
 			if strings.HasPrefix(text, "/sudo") {
-				userName := displayName(update.Message.From)
-
 				if oldName, newName, ok := handleSudoRn(text, userName); ok {
 					textMu.Lock()
 					textReplacements[oldName] = newName
 					textMu.Unlock()
-					setReaction(bot, chatID, update.Message.MessageID, "👍")
+					setReaction(bot, ctx, chatID, msg.MessageID, "👍")
 					continue
 				}
-
 				if handleSudoBanUnbanClearDelete(text, userName) {
-					setReaction(bot, chatID, update.Message.MessageID, "👍")
+					setReaction(bot, ctx, chatID, msg.MessageID, "👍")
 				} else {
-					setReaction(bot, chatID, update.Message.MessageID, "👎")
+					setReaction(bot, ctx, chatID, msg.MessageID, "👎")
 				}
 				continue
 			}
 
 			if strings.HasPrefix(text, "/сбор") || strings.HasPrefix(text, "/party") {
-				userName := displayName(update.Message.From)
 				if isBanned(userName) {
-					setReaction(bot, chatID, update.Message.MessageID, "👎")
+					setReaction(bot, ctx, chatID, msg.MessageID, "👎")
 					continue
 				}
 
 				name, limit, date, err := parseCmd(text)
 				if err != nil {
-					msg := tgbotapi.NewMessage(chatID, err.Error())
-					msg.MessageThreadID = threadID
-					_, sendErr := bot.Send(msg)
-					if sendErr != nil {
-						log.Printf("send error: %v", sendErr)
-					}
-					setReaction(bot, chatID, update.Message.MessageID, "👎")
+					_, _ = bot.SendMessage(ctx, &telego.SendMessageParams{
+						ChatID:          tu.ID(chatID),
+						Text:            err.Error(),
+						MessageThreadID: threadID,
+					})
+					setReaction(bot, ctx, chatID, msg.MessageID, "👎")
 					continue
 				}
 
 				if limit < LIMIT_MIN || limit > LIMIT_MAX {
-					msg := tgbotapi.NewMessage(chatID, LIMIT_RANGE_MSG)
-					msg.MessageThreadID = threadID
-					_, sendErr := bot.Send(msg)
-					if sendErr != nil {
-						log.Printf("send error: %v", sendErr)
-					}
-					setReaction(bot, chatID, update.Message.MessageID, "👎")
+					_, _ = bot.SendMessage(ctx, &telego.SendMessageParams{
+						ChatID:          tu.ID(chatID),
+						Text:            LIMIT_RANGE_MSG,
+						MessageThreadID: threadID,
+					})
+					setReaction(bot, ctx, chatID, msg.MessageID, "👎")
 					continue
 				}
 
-				initiator := displayName(update.Message.From)
-
+				initiator := userName
 				rally := Rally{
-					Name:        name,
-					Date:        date,
-					Limit:       limit,
-					Initiator:   initiator,
-					SignedUp:    []string{},
-					WaitingList: []string{},
-					PenciledIn:  []string{},
-					MessageID:   0,
-					ChatID:      chatID,
+					Name:      name,
+					Date:      date,
+					Limit:     limit,
+					Initiator: initiator,
+					ChatID:    chatID,
 				}
 
-				msg := tgbotapi.NewMessage(chatID, formatRally(rally))
-				msg.MessageThreadID = threadID
-				msg.ReplyMarkup = buildKeyboard(rally, rally.Initiator)
-
-				if _, err := bot.Send(msg); err != nil {
+				_, err = bot.SendMessage(ctx, &telego.SendMessageParams{
+					ChatID:      tu.ID(chatID),
+					Text:        formatRally(rally),
+					MessageThreadID: threadID,
+					ReplyMarkup: buildKeyboard(rally, rally.Initiator),
+				})
+				if err != nil {
 					log.Printf("send error: %v", err)
-					setReaction(bot, chatID, update.Message.MessageID, "👎")
+					setReaction(bot, ctx, chatID, msg.MessageID, "👎")
 				} else {
-					setReaction(bot, chatID, update.Message.MessageID, "👍")
+					setReaction(bot, ctx, chatID, msg.MessageID, "👍")
 				}
-
 				continue
 			}
 		}
 
 		if update.CallbackQuery != nil {
 			cb := update.CallbackQuery
+
 			if cb.Message == nil {
+				sendSilentCallback(bot, ctx, cb.ID)
 				continue
 			}
 
-			user := displayName(cb.From)
+			msg := cb.Message.Message()
+			if msg == nil {
+				sendSilentCallback(bot, ctx, cb.ID)
+				continue
+			}
+
+			user := displayName(&cb.From)
 			if user == "" || isBanned(user) {
-				_ = sendSilentCallback(bot, cb.ID)
+				sendSilentCallback(bot, ctx, cb.ID)
 				continue
 			}
 
-			msgText := cb.Message.Text
-
+			msgText := msg.Text
 			_ = applyTextReplacementsConsume(&msgText)
 
 			rally, err := parseRally(msgText)
 			if err != nil {
 				log.Printf("parse rally error: %v", err)
-				_ = sendSilentCallback(bot, cb.ID)
+				sendSilentCallback(bot, ctx, cb.ID)
 				continue
 			}
+
+			edited := false
+			var newText string
+			var newMarkup *telego.InlineKeyboardMarkup
 
 			switch cb.Data {
 			case "sign_up":
@@ -741,12 +734,9 @@ func main() {
 						minIdx = i
 					}
 				}
-
 				if minIdx != -1 {
-					entry := ""
-					if minN == 0 {
-						entry = user
-					} else {
+					entry := user
+					if minN != 0 {
 						entry = fmt.Sprintf("%s +%d", user, minN)
 					}
 					if len(rally.SignedUp) < rally.Limit {
@@ -758,108 +748,96 @@ func main() {
 				} else {
 					currentMax := findMaxNumberAll(rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
 					if currentMax >= MAX_PLUS_FRIENDS {
-						_ = sendCallback(bot, cb.ID, fmt.Sprintf("Максимум %d друзей уже записано", MAX_PLUS_FRIENDS))
+						sendCallback(bot, ctx, cb.ID, fmt.Sprintf("Максимум %d друзей уже записано", MAX_PLUS_FRIENDS))
 						break
 					}
-
 					if len(rally.SignedUp) < rally.Limit {
 						rally.SignedUp = addUserInstanceGlobal(rally.SignedUp, rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
 					} else {
 						rally.WaitingList = addUserInstanceGlobal(rally.WaitingList, rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
 					}
 				}
+				edited = true
 
 			case "unsign":
 				unsignGlobal(&rally, user)
+				edited = true
 
 			case "sign_up_pencil":
 				currentMax := findMaxNumberAll(rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
 				if currentMax >= MAX_PLUS_FRIENDS {
-					_ = sendCallback(bot, cb.ID, fmt.Sprintf("Максимум %d друзей уже записано", MAX_PLUS_FRIENDS))
+					sendCallback(bot, ctx, cb.ID, fmt.Sprintf("Максимум %d друзей уже записано", MAX_PLUS_FRIENDS))
 					break
 				}
 				rally.PenciledIn = addUserInstanceGlobal(rally.PenciledIn, rally.SignedUp, rally.WaitingList, rally.PenciledIn, user)
+				edited = true
 
 			case "cancel":
 				if user == rally.Initiator || isAdmin(user) {
 					if getDeleteOnCancel() && isAdmin(user) {
 						setDeleteOnCancel(false)
-						deleteMsg := tgbotapi.NewDeleteMessage(cb.Message.Chat.ID, cb.Message.MessageID)
-						if _, err := bot.Request(deleteMsg); err != nil {
-							log.Printf("delete message error: %v", err)
-						}
-						_ = sendCallback(bot, cb.ID, "Сообщение удалено")
+						_ = bot.DeleteMessage(ctx, &telego.DeleteMessageParams{
+							ChatID:    tu.ID(msg.Chat.ID),
+							MessageID: msg.MessageID,
+						})
+						sendCallback(bot, ctx, cb.ID, "Сообщение удалено")
 						continue
 					}
-
 					rally.SignedUp = filterBanned(rally.SignedUp)
 					rally.WaitingList = filterBanned(rally.WaitingList)
 					rally.PenciledIn = filterBanned(rally.PenciledIn)
-
-					edit := tgbotapi.NewEditMessageText(
-						cb.Message.Chat.ID,
-						cb.Message.MessageID,
-						formatCancelledRally(rally),
-					)
-					kb := buildResumeKeyboard(rally, user)
-					edit.ReplyMarkup = &kb
-					editIgnoreNotModified(bot, edit)
-
-					_ = sendCallback(bot, cb.ID, "Сбор отменён")
-					continue
+					newText = formatCancelledRally(rally)
+					newMarkup = buildResumeKeyboard(rally, user)
+					edited = true
+					sendCallback(bot, ctx, cb.ID, "Сбор отменён")
 				}
 
 			case "resume":
 				if user == rally.Initiator || isAdmin(user) {
-					lines := strings.Split(cb.Message.Text, "\n")
-					newText := cb.Message.Text
+					lines := strings.Split(msg.Text, "\n")
+					newText = msg.Text
 					if len(lines) > 1 && strings.TrimSpace(lines[0]) == "❌ СБОР ОТМЕНЁН ❌" {
 						newText = strings.Join(lines[1:], "\n")
 					}
-
 					_ = applyTextReplacementsConsume(&newText)
-
 					resumedRally, err := parseRally(newText)
 					if err != nil {
-						log.Printf("resume parse error: %v", err)
 						resumedRally = rally
 					}
-
 					resumedRally.SignedUp = filterBanned(resumedRally.SignedUp)
 					resumedRally.WaitingList = filterBanned(resumedRally.WaitingList)
 					resumedRally.PenciledIn = filterBanned(resumedRally.PenciledIn)
-
-					edit := tgbotapi.NewEditMessageText(
-						cb.Message.Chat.ID,
-						cb.Message.MessageID,
-						formatRally(resumedRally),
-					)
-					kb := buildKeyboard(resumedRally, resumedRally.Initiator)
-					edit.ReplyMarkup = &kb
-					editIgnoreNotModified(bot, edit)
-
-					_ = sendCallback(bot, cb.ID, "Сбор возобновлён")
-					continue
+					newText = formatRally(resumedRally)
+					newMarkup = buildKeyboard(resumedRally, resumedRally.Initiator)
+					edited = true
+					sendCallback(bot, ctx, cb.ID, "Сбор возобновлён")
 				}
 			}
 
-			rally.SignedUp = filterBanned(rally.SignedUp)
-			rally.WaitingList = filterBanned(rally.WaitingList)
-			rally.PenciledIn = filterBanned(rally.PenciledIn)
+			if edited {
+				rally.SignedUp = filterBanned(rally.SignedUp)
+				rally.WaitingList = filterBanned(rally.WaitingList)
+				rally.PenciledIn = filterBanned(rally.PenciledIn)
 
-			newText := formatRally(rally)
-			if newText != cb.Message.Text {
-				edit := tgbotapi.NewEditMessageText(
-					cb.Message.Chat.ID,
-					cb.Message.MessageID,
-					newText,
-				)
-				kb := buildKeyboard(rally, rally.Initiator)
-				edit.ReplyMarkup = &kb
-				editIgnoreNotModified(bot, edit)
+				if newText == "" {
+					newText = formatRally(rally)
+				}
+				if newMarkup == nil {
+					newMarkup = buildKeyboard(rally, rally.Initiator)
+				}
+
+				if newText != msg.Text || newMarkup != nil {
+					editParams := &telego.EditMessageTextParams{
+						ChatID:      tu.ID(msg.Chat.ID),
+						MessageID:   msg.MessageID,
+						Text:        newText,
+						ReplyMarkup: newMarkup,
+					}
+					editIgnoreNotModified(bot, ctx, editParams)
+				}
 			}
-			_ = sendSilentCallback(bot, cb.ID)
+
+			sendSilentCallback(bot, ctx, cb.ID)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
