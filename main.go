@@ -1,6 +1,7 @@
 package main
 
 import (
+	"time"
 	"context"
 	"log"
 	"os"
@@ -46,6 +47,7 @@ var (
 	textMu           sync.RWMutex
 	deleteOnCancel   bool
 	deleteMu         sync.RWMutex
+	lastEditTime 	 time.Time
 )
 
 func displayName(u *telego.User) string {
@@ -329,10 +331,18 @@ func setReaction(bot *telego.Bot, ctx context.Context, chatID int64, msgID int, 
 }
 
 func editIgnoreNotModified(bot *telego.Bot, ctx context.Context, editParams *telego.EditMessageTextParams) {
-	_, err := bot.EditMessageText(ctx, editParams)
-	if err != nil && !strings.Contains(err.Error(), "message is not modified") {
-		log.Printf("edit error: %v", err)
-	}
+    for {
+        now := time.Now()
+        if now.Sub(lastEditTime) >= 1100*time.Millisecond {
+            break
+        }
+        time.Sleep(100 * time.Millisecond)
+    }
+
+    _, err := bot.EditMessageText(ctx, editParams)
+    if err == nil {
+        lastEditTime = time.Now()
+    }
 }
 
 func sendSilentCallback(bot *telego.Bot, ctx context.Context, callbackID string) {
@@ -597,10 +607,15 @@ func main() {
 	}
 	log.Printf("Bot authorized on account @%s", me.Username)
 
-	updates, err := bot.UpdatesViaLongPolling(ctx, nil)
-	if err != nil {
-		log.Panic(err)
-	}
+	updates, err := bot.UpdatesViaLongPolling(
+    ctx,
+    &telego.GetUpdatesParams{
+        Timeout: 120,
+        Limit:   100,
+        Offset:  0,
+    },
+    telego.WithLongPollingRetryTimeout(10 * time.Second),
+)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
