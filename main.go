@@ -218,7 +218,7 @@ func parseRally(message string) (Rally, error) {
 func formatRally(r Rally) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf(
-		"🎉 Сбор: %s\n📅 Дата: %s\n🔢 Лимит: %d\n👤 Инициатор: %s\n\n✍️ Записались:\n",
+		"<tg-emoji emoji-id=\"5310228579009699834\">🎉</tg-emoji> Сбор: %s\n<tg-emoji emoji-id=\"5433614043006903194\">📅</tg-emoji> Дата: %s\n<tg-emoji emoji-id=\"5373335654476294839\">🔢</tg-emoji> Лимит: %d\n<tg-emoji emoji-id=\"5373012449597335010\">👤</tg-emoji> Инициатор: %s\n\n<tg-emoji emoji-id=\"5470060791883374114\">✍️</tg-emoji> Записались:\n",
 		r.Name, r.Date, r.Limit, r.Initiator,
 	))
 	mainCount := len(r.SignedUp)
@@ -230,12 +230,12 @@ func formatRally(r Rally) string {
 		}
 	}
 	if len(r.WaitingList) > 0 {
-		sb.WriteString("\n⏳ Лист ожидания:\n")
+		sb.WriteString("\n<tg-emoji emoji-id=\"5451646226975955576\">⏳</tg-emoji> Лист ожидания:\n")
 		for i, user := range r.WaitingList {
 			sb.WriteString(fmt.Sprintf("%d) %s\n", r.Limit+i+1, user))
 		}
 	}
-	sb.WriteString("\n✏️ Карандашом:\n")
+	sb.WriteString("\n<tg-emoji emoji-id=\"5334673106202010226\">✏️</tg-emoji> Карандашом:\n")
 	for _, user := range r.PenciledIn {
 		sb.WriteString(user + "\n")
 	}
@@ -243,30 +243,27 @@ func formatRally(r Rally) string {
 }
 
 func buildKeyboard(r Rally, userName string) *telego.InlineKeyboardMarkup {
-	buttons := [][]telego.InlineKeyboardButton{
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("✍️ Записаться ✍️").
-				WithCallbackData("sign_up").
-				WithStyle("success"),
-		),
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🧽 Отписаться 🧽").
-				WithCallbackData("unsign"),
-		),
-		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("✏️ Карандашом ✏️").
-				WithCallbackData("sign_up_pencil").
-				WithStyle("primary"),
-		),
-	}
-	if userName == r.Initiator || isAdmin(userName) {
-		buttons = append(buttons, tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("❌ Отменить ❌").
-				WithCallbackData("cancel").
-				WithStyle("danger"),
-		))
-	}
-	return tu.InlineKeyboard(buttons...)
+    return tu.InlineKeyboard(
+        tu.InlineKeyboardRow(
+            tu.InlineKeyboardButton("Записаться").
+                WithCallbackData("sign_up").
+                WithStyle("success").
+                WithIconCustomEmojiID("5470060791883374114"),
+            tu.InlineKeyboardButton("Карандашом").
+                WithCallbackData("sign_up_pencil").
+                WithStyle("primary").
+                WithIconCustomEmojiID("5334673106202010226"),
+        ),
+        tu.InlineKeyboardRow(
+            tu.InlineKeyboardButton("Отписаться").
+                WithCallbackData("unsign").
+                WithIconCustomEmojiID("5188365693803830912"),
+            tu.InlineKeyboardButton("Отменить").
+                WithCallbackData("cancel").
+                WithStyle("danger").
+                WithIconCustomEmojiID("5465665476971471368"),
+        ),
+    )
 }
 
 func buildResumeKeyboard(r Rally, userName string) *telego.InlineKeyboardMarkup {
@@ -275,9 +272,10 @@ func buildResumeKeyboard(r Rally, userName string) *telego.InlineKeyboardMarkup 
 	}
 	return tu.InlineKeyboard(
 		tu.InlineKeyboardRow(
-			tu.InlineKeyboardButton("🔄 Возобновить 🔄").
+			tu.InlineKeyboardButton("Возобновить").
 				WithCallbackData("resume").
-				WithStyle("primary"),
+				WithStyle("primary").
+				WithIconCustomEmojiID("5264727218734524899"),
 		),
 	)
 }
@@ -688,6 +686,7 @@ func main() {
 				_, err = bot.SendMessage(ctx, &telego.SendMessageParams{
 					ChatID:      tu.ID(chatID),
 					Text:        formatRally(rally),
+					ParseMode:	"HTML",
 					MessageThreadID: threadID,
 					ReplyMarkup: buildKeyboard(rally, rally.Initiator),
 				})
@@ -846,6 +845,7 @@ func main() {
 						ChatID:      tu.ID(msg.Chat.ID),
 						MessageID:   msg.MessageID,
 						Text:        newText,
+						ParseMode:   "HTML",
 						ReplyMarkup: newMarkup,
 					}
 					editIgnoreNotModified(bot, ctx, editParams)
